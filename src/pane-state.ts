@@ -340,4 +340,3 @@ export function shouldClearTruncatedPreamble(pane: string): boolean {
 
   return true
 }
-
