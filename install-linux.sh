@@ -913,6 +913,8 @@ if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
 fi
 LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [ -z "$LOCAL_IP" ] && LOCAL_IP=$(ip route get 1 2>/dev/null | awk '{print $(NF-2)}')
+[ -z "$LOCAL_IP" ] && LOCAL_IP=$(ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d/ -f1)
+[ -z "$LOCAL_IP" ] && LOCAL_IP=$(hostname -I 2>/dev/null | tr " " "\n" | grep -v "^127\|^::" | head -1)
 [ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
 if [ -n "$DASH_TOKEN" ]; then
   echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://${LOCAL_IP}:3420/?token=${DASH_TOKEN}${NC}"
