@@ -113,6 +113,7 @@ ok "pipx" $(pipx --version)
 ok "python3 $(python3 --version | awk '{print $2}')"
 ok "tmux $(tmux -V | awk '{print $2}')"
 ok "unzip" $(unzip -v | awk 'NR==1 {print $2}')
+ok "zstd $(zstd --version | awk '{print $1}')"
 
 # ─────────────────────────────────────────────
 # [2/7] Claude Code + Bun telepitese
