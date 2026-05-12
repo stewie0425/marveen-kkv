@@ -48,13 +48,34 @@ function SourceBadge({ source }: { source: 'KKV' | 'Upstream' }) {
 
 type IntegrationCategory = 'safe' | 'review'
 
-function getIntegrationCategory(components: string[] | undefined): IntegrationCategory {
-  const safe = new Set(['Core', 'Scripts', 'Tests', 'Agent Configs'])
-  const review = new Set(['API Routes', 'Dashboard Backend', 'Dependencies', 'MCP Config'])
-  if (!components || components.length === 0) return 'review'
-  if (components.some(c => review.has(c))) return 'review'
-  if (components.some(c => safe.has(c))) return 'safe'
+// Scopes extracted from conventional commit prefix: fix(scope): / feat(scope):
+const SAFE_SCOPES = new Set([
+  'kanban', 'heartbeat', 'scaffold', 'napindito', 'memory',
+  'daily-log', 'schedule', 'agent', 'core', 'channels',
+])
+const REVIEW_SCOPES = new Set([
+  'telegram-monitor', 'dashboard', 'pane-state',
+  'update', 'api', 'web', 'routes',
+])
+
+function inferCategoryFromMessage(message: string): IntegrationCategory {
+  const m = message.match(/^(?:feat|fix|chore|refactor|style|test|docs)\(([^)]+)\)/)
+  if (!m) return 'review'
+  const scope = m[1].toLowerCase()
+  if (SAFE_SCOPES.has(scope)) return 'safe'
+  if (REVIEW_SCOPES.has(scope)) return 'review'
   return 'review'
+}
+
+function getIntegrationCategory(commit: MergedCommit): IntegrationCategory {
+  const { components, message } = commit
+  if (components && components.length > 0) {
+    const safeComponents = new Set(['Core', 'Scripts', 'Tests', 'Agent Configs'])
+    const reviewComponents = new Set(['API Routes', 'Dashboard Backend', 'Dependencies', 'MCP Config'])
+    if (components.some(c => reviewComponents.has(c))) return 'review'
+    if (components.some(c => safeComponents.has(c))) return 'safe'
+  }
+  return inferCategoryFromMessage(message)
 }
 
 function IntegrationBadge({ category }: { category: IntegrationCategory }) {
@@ -344,7 +365,7 @@ export default function UpdatesPage() {
                     <div className="flex items-center gap-2 flex-wrap">
                       <SourceBadge source={c.source} />
                       {c.source === 'Upstream' && (
-                        <IntegrationBadge category={getIntegrationCategory(c.components)} />
+                        <IntegrationBadge category={getIntegrationCategory(c)} />
                       )}
                       <code className="rounded bg-[var(--color-input)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--color-text-secondary)]">
                         {c.short}
