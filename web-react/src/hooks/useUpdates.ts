@@ -4,7 +4,7 @@ import {
   useQueryClient,
 } from '@tanstack/react-query'
 import { apiFetch, apiJson } from '@/lib/api'
-import type { UpdateStatus, UpstreamStatus } from '@/types/api'
+import type { UpdateStatus } from '@/types/api'
 
 const KEY = ['updates'] as const
 
@@ -41,29 +41,3 @@ export function useApplyUpdate() {
   })
 }
 
-const UPSTREAM_KEY = ['updates', 'upstream'] as const
-
-export function useUpstreamStatus() {
-  return useQuery<UpstreamStatus>({
-    queryKey: UPSTREAM_KEY,
-    queryFn: () => apiJson<UpstreamStatus>('/api/updates/upstream'),
-    staleTime: 60_000,
-  })
-}
-
-export function useSyncUpstreamRequest() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: async (payload: { commits: string[] }) => {
-      const res = await apiFetch('/api/updates/sync-upstream-request', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-      return data
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: UPSTREAM_KEY }),
-  })
-}
