@@ -102,7 +102,7 @@ else
     ok "Repo frissitve: $MARVEEN_DIR"
   else
     echo -e "  Klonozas: $MARVEEN_DIR..."
-    git clone --depth=1 https://github.com/Szotasz/marveen.git "$MARVEEN_DIR" -q
+    git clone --depth=1 https://github.com/stewie0425/marveen-kkv.git "$MARVEEN_DIR" -q
     ok "Repo klonozva: $MARVEEN_DIR"
   fi
 fi
@@ -117,4 +117,6 @@ echo ""
 echo -e "${BOLD}[3/3] Marveen telepito inditasa...${NC}"
 echo ""
 
-exec "$MARVEEN_DIR/install-linux.sh"
+# Pipe módban (curl | bash) stdin a pipe -- /dev/tty-vel adjuk vissza
+# a terminált, hogy a read parancsok interaktívan működjenek.
+exec bash "$MARVEEN_DIR/install-linux.sh" </dev/tty
