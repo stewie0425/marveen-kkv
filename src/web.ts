@@ -42,12 +42,15 @@ import { tryHandleObsidian } from './web/routes/obsidian-proxy.js'
 import { tryHandleUserAuth } from './web/routes/user-auth.js'
 import { tryHandleUserManagement } from './web/routes/user-management.js'
 import { tryHandleUserChat } from './web/routes/user-chat.js'
+import { tryHandleVaultSecrets } from './web/routes/vault-secrets.js'
 import { hasAnyDashboardAdmin } from './db.js'
 import type { RouteContext } from './web/routes/types.js'
 
-// React build is the canonical UI. web/ stays as a fallback for legacy paths.
+// React build is the canonical UI. web-legacy stays in the tree as a
+// last-resort fallback during the migration; it can be removed once the
+// React app reaches feature parity (kanban + agents + sessions covered).
 const WEB_DIR = join(PROJECT_ROOT, 'web-react', 'dist')
-const LEGACY_WEB_DIR = join(PROJECT_ROOT, 'web')
+const LEGACY_WEB_DIR = join(PROJECT_ROOT, 'web-legacy')
 
 function ensureDirs() {
   mkdirSync(AGENTS_BASE_DIR, { recursive: true })
@@ -162,6 +165,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleUserAuth(routeCtx)) return
       if (await tryHandleUserManagement(routeCtx)) return
       if (await tryHandleUserChat(routeCtx)) return
+      if (await tryHandleVaultSecrets(routeCtx)) return
       if (await tryHandleProfiles(routeCtx)) return
       if (await tryHandleMessages(routeCtx)) return
       if (await tryHandleDailyLog(routeCtx)) return

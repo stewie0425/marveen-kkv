@@ -360,6 +360,21 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_uchat_user_id ON user_chat_messages(user_id, created_at)`)
 
+  // --- Vault Secrets (AES-256-GCM encrypted key-value store) ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vault_secrets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key_name TEXT NOT NULL UNIQUE,
+      encrypted_value TEXT NOT NULL,
+      iv TEXT NOT NULL,
+      tag TEXT NOT NULL,
+      description TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_vault_secrets_key ON vault_secrets(key_name)`)
+
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
   // re-importing. Wrapped in a transaction so a crash mid-import is safe.
@@ -1290,4 +1305,38 @@ export function getLatestAssistantMessage(userId: number, afterId: number): User
   return db.prepare(
     "SELECT * FROM user_chat_messages WHERE user_id = ? AND id > ? AND role = 'assistant' ORDER BY id ASC LIMIT 1"
   ).get(userId, afterId) as UserChatMessage | undefined
+}
+
+// --- Vault Secrets ---
+
+export interface VaultSecretRow {
+  id: number
+  key_name: string
+  encrypted_value: string
+  iv: string
+  tag: string
+  description: string | null
+  created_at: number
+  updated_at: number
+}
+
+export function listVaultSecrets(): Omit<VaultSecretRow, 'encrypted_value' | 'iv' | 'tag'>[] {
+  return db.prepare('SELECT id, key_name, description, created_at, updated_at FROM vault_secrets ORDER BY key_name ASC').all() as Omit<VaultSecretRow, 'encrypted_value' | 'iv' | 'tag'>[]
+}
+
+export function getVaultSecret(keyName: string): VaultSecretRow | undefined {
+  return db.prepare('SELECT * FROM vault_secrets WHERE key_name = ?').get(keyName) as VaultSecretRow | undefined
+}
+
+export function upsertVaultSecret(keyName: string, encryptedValue: string, iv: string, tag: string, description: string | null): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(`
+    INSERT INTO vault_secrets (key_name, encrypted_value, iv, tag, description, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(key_name) DO UPDATE SET encrypted_value=excluded.encrypted_value, iv=excluded.iv, tag=excluded.tag, description=excluded.description, updated_at=excluded.updated_at
+  `).run(keyName, encryptedValue, iv, tag, description, now, now)
+}
+
+export function deleteVaultSecret(keyName: string): boolean {
+  return db.prepare('DELETE FROM vault_secrets WHERE key_name = ?').run(keyName).changes > 0
 }

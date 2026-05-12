@@ -35,6 +35,14 @@ function AuthGate() {
   const adminAuthStatus = useAuthStatus()
   const [view, setView] = useState<AppView>({ kind: 'pending' })
 
+  // React to bearer-token logout (LogoutButton calls setAuthStatus('unauthenticated'))
+  useEffect(() => {
+    if (adminAuthStatus === 'unauthenticated' && view.kind === 'dashboard') {
+      clearUserSession()
+      setView({ kind: 'user-login' })
+    }
+  }, [adminAuthStatus, view.kind])
+
   useEffect(() => {
     let cancelled = false
 

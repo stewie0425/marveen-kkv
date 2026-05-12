@@ -1,7 +1,10 @@
 import { hasAnyDashboardAdmin } from '../../db.js'
 import { readBody, json } from '../http-helpers.js'
 import { loginUser, logoutUser, registerUser, extractUserSessionToken, getUserFromToken } from '../user-auth.js'
+import { loadOrCreateDashboardToken } from '../dashboard-auth.js'
 import type { RouteHandler } from './types.js'
+
+const DASHBOARD_TOKEN = loadOrCreateDashboardToken()
 
 // POST /api/user-auth/setup  — first-boot admin creation (only when no admin exists)
 // POST /api/user-auth/login
@@ -45,7 +48,7 @@ export const tryHandleUserAuth: RouteHandler = async ({ req, res, path, method }
       await registerUser(email, password, 'admin')
       const result = await loginUser(email, password)
       if (!result) { json(res, { error: 'Setup failed.' }, 500); return true }
-      json(res, { token: result.token, role: result.user.role, email: result.user.email })
+      json(res, { token: result.token, role: result.user.role, email: result.user.email, adminToken: DASHBOARD_TOKEN })
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Setup failed.'
       json(res, { error: msg }, 500)
@@ -73,7 +76,8 @@ export const tryHandleUserAuth: RouteHandler = async ({ req, res, path, method }
       json(res, { error: 'Invalid credentials.' }, 401)
       return true
     }
-    json(res, { token: result.token, role: result.user.role, email: result.user.email })
+    const adminToken = result.user.role === 'admin' ? DASHBOARD_TOKEN : null
+    json(res, { token: result.token, role: result.user.role, email: result.user.email, adminToken })
     return true
   }
 

@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { setUserSession, userApiJson } from '@/lib/api'
+import { setUserSession, setAuthToken, userApiJson } from '@/lib/api'
+import { setAuthStatus } from '@/lib/auth'
 
 interface Props {
   onComplete: () => void
@@ -19,11 +20,13 @@ export default function SetupPage({ onComplete }: Props) {
     setPending(true)
     setError(null)
     try {
-      const data = await userApiJson<{ token: string; role: 'admin' | 'user'; email: string }>(
+      const data = await userApiJson<{ token: string; role: 'admin' | 'user'; email: string; adminToken: string }>(
         '/api/user-auth/setup',
         { method: 'POST', body: JSON.stringify({ email, password }) },
       )
       setUserSession(data.token, data.role, data.email)
+      setAuthToken(data.adminToken)
+      setAuthStatus('authenticated')
       onComplete()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Sikertelen.')

@@ -39,7 +39,9 @@ export const HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000 // 1 hour
 export const HEARTBEAT_START_HOUR = 9
 export const HEARTBEAT_END_HOUR = 23
 
-// Outbound mail (alerts only). Configured via SMTP_* env vars.
+// Outbound mail (alerts only). Marveen sends through Kevin's Gmail via SMTP
+// + a 16-char Google App Password. Reads-side is not exposed here — Tracy
+// owns inbox search through her own MCPs.
 export const SMTP_HOST = env['SMTP_HOST'] ?? 'smtp.gmail.com'
 export const SMTP_PORT = parseInt(env['SMTP_PORT'] ?? '587', 10)
 export const SMTP_USER = env['SMTP_USER'] ?? ''

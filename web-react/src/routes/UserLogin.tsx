@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { setUserSession, userApiJson } from '@/lib/api'
+import { setUserSession, setAuthToken, userApiJson } from '@/lib/api'
+import { setAuthStatus } from '@/lib/auth'
 
 interface Props {
   onSuccess: (role: 'admin' | 'user') => void
@@ -17,11 +18,15 @@ export default function UserLoginPage({ onSuccess, onAdminToken }: Props) {
     setPending(true)
     setError(null)
     try {
-      const data = await userApiJson<{ token: string; role: 'admin' | 'user'; email: string }>(
+      const data = await userApiJson<{ token: string; role: 'admin' | 'user'; email: string; adminToken: string | null }>(
         '/api/user-auth/login',
         { method: 'POST', body: JSON.stringify({ email, password }) },
       )
       setUserSession(data.token, data.role, data.email)
+      if (data.adminToken) {
+        setAuthToken(data.adminToken)
+        setAuthStatus('authenticated')
+      }
       onSuccess(data.role)
     } catch {
       setError('Hibás email vagy jelszó.')
