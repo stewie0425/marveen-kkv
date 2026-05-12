@@ -460,7 +460,7 @@ echo -e "${BOLD}[6/7] Ollama + Whisper...${NC}"
 
 # --- Ollama telepites ---
 # zstd kotelozo az Ollama installer extractiohoz -- garantalt install fuggetlenul az [1/7] pkg listetol
-sudo apt-get install -y zstd -qq 2>/dev/null || true
+sudo apt-get update -qq && sudo apt-get install -y zstd -qq 2>/dev/null || true
 echo -e "  Ollama ellenorzese (szemantikus memoria kereseshez)..."
 if command -v ollama &>/dev/null; then
   ok "ollama mar telepitve"
