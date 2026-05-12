@@ -18,7 +18,19 @@ if [ "$OS" = "Darwin" ]; then
   launchctl load "$HOME/Library/LaunchAgents/com.${SLUG}.dashboard.plist" 2>/dev/null || true
   launchctl load "$HOME/Library/LaunchAgents/com.${SLUG}.channels.plist" 2>/dev/null || true
 elif [ "$OS" = "Linux" ]; then
-  systemctl --user start "${SLUG}-dashboard" "${SLUG}-channels"
+  if systemctl --user start "${SLUG}-dashboard" "${SLUG}-channels" 2>/dev/null; then
+    : # systemctl --user worked
+  else
+    # systemctl --user unavailable (LXC/root without D-Bus); start directly.
+    NODE_BIN="$(command -v node || echo node)"
+    nohup "$NODE_BIN" "$INSTALL_DIR/dist/index.js" \
+      >"$INSTALL_DIR/store/dashboard.log" 2>&1 &
+    disown $!
+    # Restart the main agent channels session.
+    nohup bash "$INSTALL_DIR/scripts/channels.sh" \
+      >/dev/null 2>&1 &
+    disown $!
+  fi
 fi
 
 echo "✓ Dashboard: http://localhost:3420"

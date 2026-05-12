@@ -16,6 +16,11 @@ if [ "$OS" = "Darwin" ]; then
   launchctl unload "$HOME/Library/LaunchAgents/com.${SLUG}.channels.plist" 2>/dev/null
 elif [ "$OS" = "Linux" ]; then
   systemctl --user stop "${SLUG}-dashboard" "${SLUG}-channels" 2>/dev/null || true
+  # Fallback: kill the dashboard Node process directly (needed when
+  # systemctl --user is unavailable, e.g. LXC containers without D-Bus).
+  # Also fires after a successful systemctl stop to clean up any orphan.
+  pkill -f "node.*dist/index\.js" 2>/dev/null || true
+  sleep 1
 fi
 
 # Stop the main channels tmux session. Do NOT kill sub-agent sessions --
