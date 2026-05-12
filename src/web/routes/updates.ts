@@ -7,7 +7,10 @@ import { PROJECT_ROOT, STORE_DIR } from '../../config.js'
 import { logger } from '../../logger.js'
 import {
   getUpdateStatus, refreshUpdateStatus,
+  getUpstreamStatus, refreshUpstreamStatus,
 } from '../update-checker.js'
+import { createAgentMessage } from '../../db.js'
+import { MAIN_AGENT_ID } from '../../config.js'
 import {
   checkUpdatePreflight, checkNoConcurrentUpdate, classifyLockWriteError,
   type GitRunner, type PidfileRunner,
@@ -32,6 +35,28 @@ export async function tryHandleUpdates(ctx: RouteContext): Promise<boolean> {
   if (path === '/api/updates/check' && method === 'POST') {
     const status = await refreshUpdateStatus()
     json(res, status)
+    return true
+  }
+
+  if (path === '/api/updates/upstream' && method === 'GET') {
+    json(res, getUpstreamStatus())
+    return true
+  }
+
+  if (path === '/api/updates/upstream/check' && method === 'POST') {
+    const status = await refreshUpstreamStatus()
+    json(res, status)
+    return true
+  }
+
+  if (path === '/api/updates/sync-upstream-request' && method === 'POST') {
+    try {
+      createAgentMessage('dashboard', MAIN_AGENT_ID,
+        '[Upstream sync kérés] A KKV dashboard operátora kérte a Szotasz/marveen upstream szinkronizálást. Nézd meg az upstream commitokat és delegáld Sandornak a releváns változások cherry-pickelését.')
+      json(res, { ok: true, message: 'Sync request queued' })
+    } catch (err) {
+      json(res, { error: err instanceof Error ? err.message : String(err) }, 500)
+    }
     return true
   }
 

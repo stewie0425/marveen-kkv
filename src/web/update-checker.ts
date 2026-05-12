@@ -193,6 +193,55 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
 // without anyone having to SSH in and run update.sh.
 export function startUpdateChecker(): NodeJS.Timeout {
   // First check shortly after startup; then every 15 minutes.
-  setTimeout(() => { refreshUpdateStatus().catch(() => {}) }, 10_000)
-  return setInterval(() => { refreshUpdateStatus().catch(() => {}) }, 15 * 60_000)
+  setTimeout(() => { refreshUpdateStatus().catch(() => {}); refreshUpstreamStatus().catch(() => {}) }, 10_000)
+  return setInterval(() => { refreshUpdateStatus().catch(() => {}); refreshUpstreamStatus().catch(() => {}) }, 15 * 60_000)
+}
+
+// ---------------------------------------------------------------------------
+// Upstream tracking: Szotasz/marveen (the engine repo this product is based on)
+// ---------------------------------------------------------------------------
+
+export interface UpstreamStatus {
+  upstream: string
+  commits: UpdateCommit[]
+  lastChecked: number
+  error?: string
+}
+
+const UPSTREAM_REPO = 'Szotasz/marveen'
+
+let upstreamStatusCache: UpstreamStatus = {
+  upstream: UPSTREAM_REPO,
+  commits: [],
+  lastChecked: 0,
+}
+
+export function getUpstreamStatus(): UpstreamStatus {
+  return upstreamStatusCache
+}
+
+export async function refreshUpstreamStatus(): Promise<UpstreamStatus> {
+  const status: UpstreamStatus = {
+    upstream: UPSTREAM_REPO,
+    commits: [],
+    lastChecked: Date.now(),
+  }
+  try {
+    const res = await fetch(`https://api.github.com/repos/${UPSTREAM_REPO}/commits?per_page=15&sha=main`, {
+      headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'marveen-update-check' },
+    })
+    if (!res.ok) throw new Error(`GitHub /commits -> ${res.status}`)
+    const raw = await res.json() as { sha: string; commit: { message: string; author: { name: string; date: string } } }[]
+    status.commits = raw.map(c => ({
+      sha: c.sha,
+      short: c.sha.slice(0, 7),
+      message: (c.commit.message || '').split('\n')[0],
+      author: c.commit.author?.name || '',
+      date: c.commit.author?.date || '',
+    }))
+  } catch (err) {
+    status.error = err instanceof Error ? err.message : String(err)
+  }
+  upstreamStatusCache = status
+  return status
 }
