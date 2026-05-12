@@ -7,12 +7,12 @@ import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-au
 import { json } from './web/http-helpers.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
 import { ensureAgentHooks } from './web/agent-scaffold.js'
+import { refreshMarveenBotUsername } from './web/telegram.js'
+import { startMessageRouter } from './web/message-router.js'
 import {
   getCoordinationWatchdogConfig,
   startCoordinationWatchdog,
 } from './web/coordination-watchdog.js'
-import { refreshMarveenBotUsername } from './web/telegram.js'
-import { startMessageRouter } from './web/message-router.js'
 import { startUpdateChecker } from './web/update-checker.js'
 import { startMcpListChecker } from './web/mcp-list.js'
 import { startScheduleRunner } from './web/schedule-runner.js'
@@ -45,7 +45,9 @@ import { tryHandleUserChat } from './web/routes/user-chat.js'
 import { hasAnyDashboardAdmin } from './db.js'
 import type { RouteContext } from './web/routes/types.js'
 
+// KKV product uses the vanilla-JS frontend in web/.
 const WEB_DIR = join(PROJECT_ROOT, 'web')
+const LEGACY_WEB_DIR = join(PROJECT_ROOT, 'web')
 
 function ensureDirs() {
   mkdirSync(AGENTS_BASE_DIR, { recursive: true })
@@ -74,21 +76,12 @@ export function startWebServer(port = 3420): http.Server {
     const method = req.method || 'GET'
 
     const origin = req.headers.origin
-    if (origin && allowedOrigins.has(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin)
-      res.setHeader('Vary', 'Origin')
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-    }
-    if (method === 'OPTIONS') { res.writeHead(204); res.end(); return }
-
-    // Block state-changing requests from browsers running on foreign origins.
+    const reqHost = req.headers.host
     // Same-origin: the request's Origin host:port matches the Host header it
     // arrived on. This covers the common deploy where the dashboard is fronted
     // by a reverse proxy (Caddy/nginx) on a custom hostname, or reached via
     // Tailscale/LAN IP -- the page and its API calls share that origin, so the
     // browser-CSRF threat the allowlist defends against does not apply.
-    const reqHost = req.headers.host
     let originHost = ''
     try { originHost = origin ? new URL(origin).host : '' } catch { /* malformed */ }
     const sameOrigin = !!originHost && !!reqHost && originHost === reqHost
@@ -99,26 +92,53 @@ export function startWebServer(port = 3420): http.Server {
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Vary', 'Origin')
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+      // Authorization is a CORS-non-simple header, so cross-origin clients
+      // need it explicitly listed here for the bearer to survive preflight.
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
     }
+    if (method === 'OPTIONS') { res.writeHead(204); res.end(); return }
 
+    // Block state-changing requests from browsers running on foreign origins.
+    // Same-origin fetches from the dashboard don't set Origin on some browsers, so we
+    // accept requests where Origin is absent OR whitelisted OR same-origin (Host
+    // header agrees). Bearer-bypass: a foreign origin that already carries a
+    // valid dashboard token cannot have come from an unintentional browser
+    // fetch (browsers don't auto-attach Authorization headers cross-origin),
+    // so the CSRF shape this gate exists to defend against is not present.
     if (!isSafeMethod(method) && origin && !originAccepted) {
       const bearerOk = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
       if (!bearerOk) {
+        logger.warn(
+          { origin, host: reqHost, method, path },
+          'Dashboard CORS reject: foreign origin without bearer',
+        )
         res.writeHead(403, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Origin not allowed' }))
         return
       }
+      // Reflect the origin so the browser doesn't block reading the response.
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Vary', 'Origin')
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+      logger.info(
+        { origin, host: reqHost, method, path },
+        'Dashboard CORS bypass via bearer',
+      )
     }
 
     // Auth gate: every /api/* route requires a bearer token in the Authorization
     // header. Exceptions: the auth-status probe (so the client can tell whether
     // it needs to prompt the user), and GET requests for avatar images (loaded
     // via <img src> which can't carry headers -- these are non-sensitive assets).
+    // User-facing routes handle their own auth (user session tokens, not bearer).
+    // Exempt them from the admin bearer gate entirely.
+    const isUserRoute =
+      path.startsWith('/api/user-auth/') ||
+      path.startsWith('/api/user-chat/') ||
+      path.startsWith('/api/user-management/')
+
     const isPublicApi =
+      isUserRoute ||
       (path === '/api/auth/status' && method === 'GET') ||
       (method === 'GET' && (
         path === '/api/marveen/avatar' ||
@@ -128,18 +148,8 @@ export function startWebServer(port = 3420): http.Server {
       const ok = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
       return json(res, { authenticated: ok })
     }
-    // User-facing routes handle their own auth (user session tokens, not bearer).
-    // Exempt them from the admin bearer gate entirely.
-    const isUserRoute =
-      path.startsWith('/api/user-auth/') ||
-      path.startsWith('/api/user-chat/') ||
-      path.startsWith('/api/user-management/')
-
     if (path.startsWith('/api/') && !isPublicApi) {
-      if (
-        !isUserRoute &&
-        !checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
-      ) {
+      if (!checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized' }))
         return
@@ -164,15 +174,15 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleAgentsSkills(routeCtx)) return
       if (await tryHandleSkills(routeCtx)) return
       if (await tryHandleAgents(routeCtx, WEB_DIR)) return
-      if (await tryHandleMarveen(routeCtx, WEB_DIR)) return
-      if (await tryHandleOverview(routeCtx)) return
-      if (await tryHandleUpdates(routeCtx)) return
-      if (await tryHandleStatus(routeCtx)) return
       if (await tryHandleSessions(routeCtx)) return
       if (await tryHandleVault(routeCtx)) return
       if (await tryHandleObsidian(routeCtx)) return
       if (await tryHandleSecrets(routeCtx)) return
-      if (await tryHandleStatic(routeCtx, WEB_DIR)) return
+      if (await tryHandleMarveen(routeCtx, WEB_DIR)) return
+      if (await tryHandleOverview(routeCtx)) return
+      if (await tryHandleUpdates(routeCtx)) return
+      if (await tryHandleStatus(routeCtx)) return
+      if (await tryHandleStatic(routeCtx, WEB_DIR, LEGACY_WEB_DIR)) return
 
       res.writeHead(404)
       res.end('Not found')
@@ -252,6 +262,16 @@ export function startWebServer(port = 3420): http.Server {
   const routerInterval = startMessageRouter()
   logger.info('Agent message router started (5s poll)')
 
+  const watchdogInterval = startCoordinationWatchdog()
+  const watchdogCfg = getCoordinationWatchdogConfig()
+  logger.info(
+    {
+      scanIntervalMs: watchdogCfg.scanIntervalMs,
+      stuckThresholdMs: watchdogCfg.stuckThresholdMs,
+    },
+    'Coordination watchdog started',
+  )
+
   const scheduleInterval = startScheduleRunner()
   logger.info('Schedule runner started (60s poll)')
 
@@ -285,29 +305,13 @@ export function startWebServer(port = 3420): http.Server {
     logger.warn({ err }, 'Agent hook backfill skipped')
   }
 
-  const watchdogInterval = startCoordinationWatchdog()
-  const watchdogCfg = getCoordinationWatchdogConfig()
-  logger.info(
-    {
-      scanIntervalMs: watchdogCfg.scanIntervalMs,
-      stuckThresholdMs: watchdogCfg.stuckThresholdMs,
-    },
-    'Coordination watchdog started',
-  )
-
-  // Log whether any dashboard admin exists (first-boot hint)
-  try {
-    const hasAdmin = hasAnyDashboardAdmin()
-    if (!hasAdmin) logger.info('No dashboard admin yet -- first-boot setup wizard will run')
-  } catch { /* non-fatal */ }
-
   const origClose = server.close.bind(server)
   server.close = (cb?: (err?: Error) => void) => {
     clearInterval(routerInterval)
+    clearInterval(watchdogInterval)
     clearInterval(scheduleInterval)
     clearInterval(pluginMonitorInterval)
     clearInterval(updateCheckerInterval)
-    clearInterval(watchdogInterval)
     return origClose(cb)
   }
 

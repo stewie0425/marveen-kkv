@@ -2,12 +2,26 @@ import { randomUUID } from 'node:crypto'
 import {
   listKanbanCards, createKanbanCard, updateKanbanCard,
   deleteKanbanCard, moveKanbanCard, archiveKanbanCard,
-  getKanbanComments, addKanbanComment, listKanbanProjects,
+  getKanbanComments, addKanbanComment,
+  getKanbanCard, createAgentMessage,
 } from '../../db.js'
-import { OWNER_NAME } from '../../config.js'
+import { OWNER_NAME, BOT_NAME, MAIN_AGENT_ID } from '../../config.js'
+import { logger } from '../../logger.js'
 import { listAgentNames } from '../agent-config.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
+
+// The kanban comment dropdown lets the operator pick a target — the
+// label is one of: OWNER_NAME (the human, no forwarding), BOT_NAME
+// (= main agent id once normalized), or a sub-agent slug. Resolve to
+// the slug the message router expects, or null when no forwarding
+// applies.
+function resolveForwardTarget(author: string): string | null {
+  if (!author) return null
+  if (author === OWNER_NAME) return null
+  if (author === BOT_NAME) return MAIN_AGENT_ID
+  return listAgentNames().includes(author) ? author : null
+}
 
 export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
@@ -17,16 +31,11 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
-  if (path === '/api/kanban-projects' && method === 'GET') {
-    json(res, listKanbanProjects())
-    return true
-  }
-
   if (path === '/api/kanban/assignees' && method === 'GET') {
     const agents = listAgentNames().map((name) => ({ name, type: 'agent' }))
     json(res, [
       { name: OWNER_NAME, type: 'owner' },
-      { name: 'Marveen', type: 'bot' },
+      { name: BOT_NAME, type: 'bot' },
       ...agents,
     ])
     return true
@@ -87,7 +96,31 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     const body = await readBody(req)
     const { author, content } = JSON.parse(body.toString())
     if (!author || !content) { json(res, { error: 'Szerző és tartalom kötelező' }, 400); return true }
-    json(res, addKanbanComment(cardId, author, content))
+    const comment = addKanbanComment(cardId, author, content)
+
+    // Forward the comment as an agent message when the dropdown points at
+    // a real agent target. The dropdown's "Küldés" button used to only
+    // persist a DB row -- the agent never saw it. Forwarding is best-effort:
+    // a routing failure here must not break the comment write.
+    let forwarded: { id: number; to: string } | null = null
+    const target = resolveForwardTarget(author)
+    if (target) {
+      try {
+        const card = getKanbanCard(cardId)
+        const title = card?.title ?? cardId
+        const formatted = `[Kanban kartya: ${title} (#${cardId})]\n\n${content}`
+        const msg = createAgentMessage(OWNER_NAME, target, formatted)
+        forwarded = { id: msg.id, to: msg.to_agent }
+        logger.info(
+          { cardId, msgId: msg.id, to: target },
+          'Kanban comment forwarded to agent',
+        )
+      } catch (err) {
+        logger.warn({ err, cardId, target }, 'Kanban comment forward failed')
+      }
+    }
+
+    json(res, { ...comment, forwarded })
     return true
   }
 

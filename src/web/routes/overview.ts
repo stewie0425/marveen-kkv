@@ -9,6 +9,7 @@ import {
 import { readAgentTeam } from '../agent-team.js'
 import { isAgentRunning } from '../agent-process.js'
 import { json } from '../http-helpers.js'
+import { fetchRecentVaultDocs } from './vault.js'
 import type { RouteContext } from './types.js'
 
 // Count "real" user turns (operator prompts, Telegram messages) in every
@@ -117,6 +118,21 @@ export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
         })
       }
     } catch { /* ignore */ }
+    // Cold-tier promotions land in the RAG vault, not the SQLite memories
+    // table, so /api/overview was blind to them. Pull a small recent slice
+    // here so vault writes show up alongside hot/warm memories. No-op when
+    // RAG_TOKEN is unset (sqlite-only deploys).
+    try {
+      const vaultDocs = await fetchRecentVaultDocs(6)
+      for (const d of vaultDocs) {
+        const label = d.title || d.vault_path || d.id
+        activity.push({
+          icon: 'vault',
+          text: `${d.agent_id}: ${label.slice(0, 80)}${label.length > 80 ? '…' : ''}`,
+          at: d.created_at * 1000,
+        })
+      }
+    } catch { /* RAG unreachable: skip silently */ }
     activity.sort((a, b) => b.at - a.at)
 
     const agentsForTeam: Array<{ id: string; label: string; role: string; running: boolean; hasAvatar: boolean; avatarUrl: string }> = []

@@ -6,13 +6,13 @@ import { logger } from '../../logger.js'
 import { MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
 import { createAgentMessage } from '../../db.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
-import { getSecret } from '../vault.js'
 import {
   agentDir,
-  agentConfigRoot,
   DEFAULT_MODEL,
   readFileOr,
   extractDescriptionFromClaudeMd,
+  readAgentDescription,
+  writeAgentDescription,
   findAvatarForAgent,
   resolveModelId,
   readAgentModel,
@@ -22,7 +22,6 @@ import {
   readAgentSecurityProfile,
   writeAgentSecurityProfile,
   listAgentNames,
-  isKnownAgent,
 } from '../agent-config.js'
 import {
   readAgentTeam,
@@ -33,22 +32,17 @@ import {
 } from '../agent-team.js'
 import {
   readAgentTelegramConfig,
-  readMarveenTelegramConfig,
   sendAvatarChangeMessage,
   sendWelcomeMessage,
   validateTelegramToken,
   parseTelegramToken,
 } from '../telegram.js'
 import {
-  createInvite,
-  listInvites,
-  revokeInvite,
-} from '../telegram-invites.js'
-import {
   writeAgentSettingsFromProfile,
   scaffoldAgentDir,
   generateClaudeMd,
   generateSoulMd,
+  provisionVaultFolder,
 } from '../agent-scaffold.js'
 import {
   isAgentRunning,
@@ -90,8 +84,7 @@ interface AgentDetail extends AgentSummary {
 
 function getAgentSummary(name: string): AgentSummary {
   const dir = agentDir(name)
-  const configRoot = agentConfigRoot(name)
-  const claudeMd = readFileOr(join(configRoot, 'CLAUDE.md'), '')
+  const claudeMd = readFileOr(join(dir, 'CLAUDE.md'), '')
   const soulMd = readFileOr(join(dir, 'SOUL.md'), '')
   const tg = readAgentTelegramConfig(name)
   const hasClaudeMd = claudeMd.trim().length > 0
@@ -102,7 +95,7 @@ function getAgentSummary(name: string): AgentSummary {
   return {
     name,
     displayName: readAgentDisplayName(name),
-    description: extractDescriptionFromClaudeMd(claudeMd),
+    description: readAgentDescription(name, claudeMd),
     model: readAgentModel(name),
     securityProfile: readAgentSecurityProfile(name),
     team: readAgentTeam(name),
@@ -117,9 +110,8 @@ function getAgentSummary(name: string): AgentSummary {
 
 function getAgentDetail(name: string): AgentDetail {
   const dir = agentDir(name)
-  const configRoot = agentConfigRoot(name)
   const summary = getAgentSummary(name)
-  const claudeMd = readFileOr(join(configRoot, 'CLAUDE.md'), '')
+  const claudeMd = readFileOr(join(dir, 'CLAUDE.md'), '')
   const soulMd = readFileOr(join(dir, 'SOUL.md'), '')
   const mcpJson = readFileOr(join(dir, '.mcp.json'), '{}')
 
@@ -152,32 +144,6 @@ function listAgentSummaries(): AgentSummary[] {
 
 export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promise<boolean> {
   const { req, res, path, method } = ctx
-
-  // Lists every model the dashboard is willing to serve up to an agent.
-  // Claude IDs are static. DeepSeek is gated behind a vault secret because
-  // the agent-process launcher reads the key from there at start time --
-  // surfacing the option in the UI without the key would let the operator
-  // pick a model that 401s on first prompt. The frontend renders this list
-  // both in the "new agent" wizard and the agent edit panel.
-  if (path === '/api/models/available' && method === 'GET') {
-    const hasDeepseek = getSecret('DEEPSEEK_API_KEY') !== null
-    json(res, {
-      claude: [
-        { id: 'claude-opus-4-7', label: 'Opus 4.7 (legújabb, legjobb)' },
-        { id: 'claude-opus-4-6', label: 'Opus 4.6' },
-        { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (alapértelmezett)' },
-        { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 (leggyorsabb)' },
-      ],
-      deepseek: hasDeepseek
-        ? [
-            { id: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro (1M kontextus, erősebb)' },
-            { id: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash (1M kontextus, gyorsabb/olcsóbb)' },
-          ]
-        : [],
-      deepseekConfigured: hasDeepseek,
-    })
-    return true
-  }
 
   if (path === '/api/agents' && method === 'GET') {
     json(res, listAgentSummaries())
@@ -212,6 +178,9 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       atomicWriteFileSync(join(agentDir(name), 'CLAUDE.md'), claudeMd)
       atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), soulMd)
       logger.info({ name }, 'Agent created successfully')
+
+      // Provision vault subfolder asynchronously — never blocks the response.
+      provisionVaultFolder(name).catch(err => logger.warn({ name, err }, 'provisionVaultFolder rejected'))
 
       const allAgents = listAgentNames()
       const runningAgents = allAgents.filter(a => a !== name && isAgentRunning(a))
@@ -530,151 +499,6 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     return true
   }
 
-  // GET /api/agents/:name/telegram/allowed
-  // Returns the live allowlist: DM senders (allowFrom) + groups.
-  const tgAllowedListMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/allowed$/)
-  if (tgAllowedListMatch && method === 'GET') {
-    const name = decodeURIComponent(tgAllowedListMatch[1])
-    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
-      json(res, { error: 'Agent not found' }, 404)
-      return true
-    }
-    const accessPath = name === MAIN_AGENT_ID
-      ? join(homedir(), '.claude', 'channels', 'telegram', 'access.json')
-      : join(agentDir(name), '.claude', 'channels', 'telegram', 'access.json')
-    const accessContent = readFileOr(accessPath, '{}')
-    try {
-      const access = JSON.parse(accessContent)
-      const users: string[] = Array.isArray(access.allowFrom) ? access.allowFrom : []
-      const groups = Object.entries(access.groups || {}).map(([id, policy]) => ({ id, policy }))
-      json(res, { users, groups })
-    } catch {
-      json(res, { users: [], groups: [] })
-    }
-    return true
-  }
-
-  // POST /api/agents/:name/telegram/invites
-  // Generates a one-time deep-link token. The invite-monitor auto-approves
-  // the next pending entry during the validity window, then re-locks
-  // dmPolicy to 'allowlist' once no live invites remain.
-  const tgInviteCreateMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/invites$/)
-  if (tgInviteCreateMatch && method === 'POST') {
-    const name = decodeURIComponent(tgInviteCreateMatch[1])
-    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
-      json(res, { error: 'Agent not found' }, 404)
-      return true
-    }
-    let botUsername: string | undefined
-    if (name === MAIN_AGENT_ID) {
-      botUsername = readMarveenTelegramConfig().botUsername
-    } else {
-      botUsername = readAgentTelegramConfig(name).botUsername
-    }
-    if (!botUsername) {
-      const tokenPath = name === MAIN_AGENT_ID
-        ? join(homedir(), '.claude', 'channels', 'telegram', '.env')
-        : join(agentDir(name), '.claude', 'channels', 'telegram', '.env')
-      try {
-        const env = readFileOr(tokenPath, '')
-        const m = env.match(/TELEGRAM_BOT_TOKEN=(.+)/)
-        const tok = m?.[1]?.trim()
-        if (tok) {
-          const r = await validateTelegramToken(tok)
-          if (r.ok) botUsername = r.botUsername
-        }
-      } catch { /* ignore */ }
-    }
-    const accessPath = name === MAIN_AGENT_ID
-      ? join(homedir(), '.claude', 'channels', 'telegram', 'access.json')
-      : join(agentDir(name), '.claude', 'channels', 'telegram', 'access.json')
-    try {
-      const result = createInvite(accessPath, botUsername)
-      json(res, result)
-    } catch (err) {
-      logger.error({ err }, 'Failed to create invite')
-      json(res, { error: 'Failed to create invite' }, 500)
-    }
-    return true
-  }
-
-  // GET /api/agents/:name/telegram/invites
-  const tgInviteListMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/invites$/)
-  if (tgInviteListMatch && method === 'GET') {
-    const name = decodeURIComponent(tgInviteListMatch[1])
-    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
-      json(res, { error: 'Agent not found' }, 404)
-      return true
-    }
-    const accessPath = name === MAIN_AGENT_ID
-      ? join(homedir(), '.claude', 'channels', 'telegram', 'access.json')
-      : join(agentDir(name), '.claude', 'channels', 'telegram', 'access.json')
-    let botUsername: string | undefined
-    if (name === MAIN_AGENT_ID) {
-      botUsername = readMarveenTelegramConfig().botUsername
-    } else {
-      botUsername = readAgentTelegramConfig(name).botUsername
-    }
-    const items = listInvites(accessPath).map((inv) => ({
-      ...inv,
-      deepLink: botUsername ? `https://t.me/${botUsername}?start=invite-${inv.token}` : undefined,
-    }))
-    json(res, items)
-    return true
-  }
-
-  // DELETE /api/agents/:name/telegram/invites/:token
-  const tgInviteRevokeMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/invites\/(.+)$/)
-  if (tgInviteRevokeMatch && method === 'DELETE') {
-    const name = decodeURIComponent(tgInviteRevokeMatch[1])
-    const token = decodeURIComponent(tgInviteRevokeMatch[2])
-    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
-      json(res, { error: 'Agent not found' }, 404)
-      return true
-    }
-    const accessPath = name === MAIN_AGENT_ID
-      ? join(homedir(), '.claude', 'channels', 'telegram', 'access.json')
-      : join(agentDir(name), '.claude', 'channels', 'telegram', 'access.json')
-    const ok = revokeInvite(accessPath, token)
-    if (!ok) { json(res, { error: 'Invite not found' }, 404); return true }
-    json(res, { ok: true })
-    return true
-  }
-
-  // DELETE /api/agents/:name/telegram/allowed/:type/:id
-  // type = "user" or "group", id = senderId or groupId.
-  const tgAllowedRemoveMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/allowed\/(user|group)\/(.+)$/)
-  if (tgAllowedRemoveMatch && method === 'DELETE') {
-    const name = decodeURIComponent(tgAllowedRemoveMatch[1])
-    const kind = tgAllowedRemoveMatch[2]
-    const id = decodeURIComponent(tgAllowedRemoveMatch[3])
-    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
-      json(res, { error: 'Agent not found' }, 404)
-      return true
-    }
-    const tgDir = name === MAIN_AGENT_ID
-      ? join(homedir(), '.claude', 'channels', 'telegram')
-      : join(agentDir(name), '.claude', 'channels', 'telegram')
-    const accessPath = join(tgDir, 'access.json')
-    try {
-      const access = JSON.parse(readFileOr(accessPath, '{}'))
-      if (kind === 'user') {
-        access.allowFrom = (access.allowFrom || []).filter((s: string) => s !== id)
-        const approvedFile = join(tgDir, 'approved', id)
-        try { if (existsSync(approvedFile)) unlinkSync(approvedFile) } catch { /* ignore */ }
-      } else {
-        if (access.groups) delete access.groups[id]
-      }
-      atomicWriteFileSync(accessPath, JSON.stringify(access, null, 2))
-      logger.info({ name, kind, id }, 'Telegram allowlist entry removed')
-      json(res, { ok: true })
-    } catch (err) {
-      logger.error({ err }, 'Failed to remove allowlist entry')
-      json(res, { error: 'Failed to remove allowlist entry' }, 500)
-    }
-    return true
-  }
-
   const startMatch = path.match(/^\/api\/agents\/([^/]+)\/start$/)
   if (startMatch && method === 'POST') {
     const name = decodeURIComponent(startMatch[1])
@@ -705,21 +529,22 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const agentMatch = path.match(/^\/api\/agents\/([^/]+)$/)
   if (agentMatch && method === 'GET') {
     const name = decodeURIComponent(agentMatch[1])
-    if (!isKnownAgent(name)) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     json(res, getAgentDetail(name))
     return true
   }
 
   if (agentMatch && method === 'PUT') {
     const name = decodeURIComponent(agentMatch[1])
-    if (!isKnownAgent(name)) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     const body = await readBody(req)
-    const configRoot = agentConfigRoot(name)
-    const data = JSON.parse(body.toString()) as { claudeMd?: string; soulMd?: string; mcpJson?: string; model?: string }
-    if (data.claudeMd !== undefined) atomicWriteFileSync(join(configRoot, 'CLAUDE.md'), data.claudeMd)
+    const data = JSON.parse(body.toString()) as { claudeMd?: string; soulMd?: string; mcpJson?: string; model?: string; displayName?: string; description?: string }
+    if (data.claudeMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'CLAUDE.md'), data.claudeMd)
     if (data.soulMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), data.soulMd)
     if (data.mcpJson !== undefined) atomicWriteFileSync(join(agentDir(name), '.mcp.json'), data.mcpJson)
     if (data.model !== undefined) writeAgentModel(name, data.model)
+    if (data.displayName !== undefined) writeAgentDisplayName(name, data.displayName.trim())
+    if (data.description !== undefined) writeAgentDescription(name, data.description)
     json(res, { ok: true })
     return true
   }

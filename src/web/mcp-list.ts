@@ -41,15 +41,6 @@ export function getMcpListCache(): McpListCache {
   return mcpListCache
 }
 
-export function purgeFromMcpListCache(name: string): boolean {
-  const before = mcpListCache.entries.length
-  mcpListCache = {
-    ...mcpListCache,
-    entries: mcpListCache.entries.filter(e => e.name !== name),
-  }
-  return mcpListCache.entries.length < before
-}
-
 // Private working directory for `claude mcp list`. Running from /tmp
 // directly was tempting (no project-local .mcp.json to spawn), but on
 // multi-user hosts any user with write access to /tmp can plant a
@@ -166,9 +157,20 @@ export function refreshMcpListCache(): Promise<McpListCache> {
 }
 
 export function startMcpListChecker(): void {
-  // Delayed first run so the main main-channels tmux session has time to
-  // claim the telegram poller token before `claude mcp list` tries to
-  // health-check the plugin. No periodic auto-refresh: every run spawns
-  // the telegram plugin for a health check, which can race the live bot.
-  setTimeout(() => { refreshMcpListCache().catch(() => {}) }, 30_000)
+  // Intentionally no automatic refresh on dashboard boot.
+  //
+  // `claude mcp list` spawns every configured stdio plugin for a health
+  // check (the help text confirms this and the CLI offers no skip flag).
+  // For the telegram plugin specifically that means a fresh `bun server.ts`
+  // child boots up, runs the bot-lock takeover at the top of the plugin
+  // (reads bot.pid, SIGTERM-s the previous holder), and then exits because
+  // it has no live MCP stdio parent -- killing the marveen-channels bun in
+  // the process. We saw this race kill Marveen's plugin on every dashboard
+  // restart. The previous 30s delay was an attempt to mitigate it but only
+  // narrowed the window.
+  //
+  // The MCP list cache is now populated on demand via the Connectors UI
+  // "Frissítés" button (POST /api/connectors/refresh -> refreshMcpListCache).
+  // First page load after a restart sees an empty list until the operator
+  // clicks refresh; that's a one-click cost in exchange for a stable bot.
 }

@@ -1,4 +1,4 @@
-import { appendDailyLog, getDailyLog, getDailyLogDates } from '../../db.js'
+import { getMemoryBackend } from '../../memory/backend.js'
 import { MAIN_AGENT_ID } from '../../config.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
@@ -10,7 +10,8 @@ export async function tryHandleDailyLog(ctx: RouteContext): Promise<boolean> {
     const body = await readBody(req)
     const data = JSON.parse(body.toString()) as { agent_id?: string; content: string }
     if (!data.content?.trim()) { json(res, { error: 'Content required' }, 400); return true }
-    appendDailyLog(data.agent_id || MAIN_AGENT_ID, data.content.trim())
+    const backend = await getMemoryBackend()
+    await backend.appendDailyLog(data.agent_id || MAIN_AGENT_ID, data.content.trim())
     json(res, { ok: true })
     return true
   }
@@ -18,13 +19,15 @@ export async function tryHandleDailyLog(ctx: RouteContext): Promise<boolean> {
   if (path === '/api/daily-log' && method === 'GET') {
     const agent = url.searchParams.get('agent') || MAIN_AGENT_ID
     const date = url.searchParams.get('date') || new Date().toISOString().split('T')[0]
-    json(res, getDailyLog(agent, date))
+    const backend = await getMemoryBackend()
+    json(res, await backend.getDailyLog(agent, date))
     return true
   }
 
   if (path === '/api/daily-log/dates' && method === 'GET') {
     const agent = url.searchParams.get('agent') || MAIN_AGENT_ID
-    json(res, getDailyLogDates(agent))
+    const backend = await getMemoryBackend()
+    json(res, await backend.getDailyLogDates(agent))
     return true
   }
 

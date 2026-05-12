@@ -687,7 +687,6 @@ export interface KanbanCard {
   status: 'planned' | 'in_progress' | 'waiting' | 'done'
   assignee: string | null
   priority: 'low' | 'normal' | 'high' | 'urgent'
-  project: string | null
   due_date: number | null
   sort_order: number
   created_at: number
@@ -731,23 +730,23 @@ export function createKanbanCard(card: {
   status?: KanbanCard['status']
   assignee?: string
   priority?: KanbanCard['priority']
-  project?: string
   due_date?: number
 }): void {
   const now = Math.floor(Date.now() / 1000)
   const status = card.status ?? 'planned'
+  // Get max sort_order for that status column
   const maxRow = db.prepare(
     'SELECT MAX(sort_order) as m FROM kanban_cards WHERE status = ? AND archived_at IS NULL'
   ).get(status) as { m: number | null }
   const sortOrder = (maxRow?.m ?? -1) + 1
 
   db.prepare(
-    `INSERT INTO kanban_cards (id, title, description, status, assignee, priority, project, due_date, sort_order, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO kanban_cards (id, title, description, status, assignee, priority, due_date, sort_order, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     card.id, card.title, card.description ?? null, status,
     card.assignee ?? null, card.priority ?? 'normal',
-    card.project ?? null, card.due_date ?? null, sortOrder, now, now
+    card.due_date ?? null, sortOrder, now, now
   )
 }
 
@@ -757,9 +756,9 @@ export function updateKanbanCard(id: string, fields: Partial<Omit<KanbanCard, 'i
   const now = Math.floor(Date.now() / 1000)
   const f = { ...card, ...fields, updated_at: now }
   return db.prepare(
-    `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, due_date=?, sort_order=?, updated_at=?, archived_at=?
+    `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, due_date=?, sort_order=?, updated_at=?, archived_at=?
      WHERE id=?`
-  ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.due_date, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
+  ).run(f.title, f.description, f.status, f.assignee, f.priority, f.due_date, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
 }
 
 export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrder: number): boolean {
@@ -772,13 +771,6 @@ export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrd
 export function archiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
   return db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
-}
-
-export function listKanbanProjects(): string[] {
-  const rows = db.prepare(
-    "SELECT DISTINCT project FROM kanban_cards WHERE project IS NOT NULL AND project != '' AND archived_at IS NULL ORDER BY project"
-  ).all() as Array<{ project: string }>
-  return rows.map(r => r.project)
 }
 
 export function deleteKanbanCard(id: string): boolean {
@@ -853,6 +845,11 @@ export function createAgentMessage(
 ): AgentMessage {
   const now = Math.floor(Date.now() / 1000)
   const initialResult = opts.closureAck ? 'closure-ack: no reply expected' : null
+  // A new (from -> to) message is the natural reply that closes any prior
+  // (to -> from) deliveries still parked in 'delivered'. Without this,
+  // delivered messages never reach 'done' and the inter-agent queue grows
+  // indefinitely, masking real coordination stalls. COALESCE preserves any
+  // audit string the watchdog has already stamped into result.
   const tx = db.transaction(() => {
     const info = db.prepare(
       'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, result) VALUES (?, ?, ?, ?, ?, ?)'
@@ -929,6 +926,50 @@ export function countTaskRunsBetween(fromTs: number, toTs?: number): number {
 
 export function getAgentMessage(id: number): AgentMessage | undefined {
   return db.prepare('SELECT * FROM agent_messages WHERE id = ?').get(id) as AgentMessage | undefined
+}
+
+// Stuck-coordination scan: deliveries past the cutoff that have neither been
+// completed nor produced a reverse-direction reply. The watchdog filters this
+// further by pane state -- a recipient that is still genuinely working is not
+// stuck.
+//
+// Already-alerted rows (result LIKE 'stuck-alert sent at%') are excluded so an
+// alert never fires twice for the same message, even across dashboard restarts
+// when the watchdog's in-memory dedup Set is empty.
+export function getStuckDeliveredMessages(maxDeliveredAtSec: number, limit = 50): AgentMessage[] {
+  return db.prepare(`
+    SELECT m.* FROM agent_messages m
+    WHERE m.status = 'delivered'
+      AND m.completed_at IS NULL
+      AND m.delivered_at IS NOT NULL
+      AND m.delivered_at < ?
+      AND (m.result IS NULL OR (
+        m.result NOT LIKE 'stuck-alert sent at%'
+        AND m.result NOT LIKE 'closure-ack%'
+      ))
+      AND NOT EXISTS (
+        SELECT 1 FROM agent_messages r
+        WHERE r.from_agent = m.to_agent
+          AND r.to_agent = m.from_agent
+          AND r.created_at > m.delivered_at
+      )
+    ORDER BY m.delivered_at ASC
+    LIMIT ?
+  `).all(maxDeliveredAtSec, limit) as AgentMessage[]
+}
+
+// Stamp a stuck-alert audit marker without changing status. createAgentMessage's
+// auto-complete UPDATE uses COALESCE so this string survives natural closure.
+export function markAgentMessageStuckAlerted(id: number, atSec: number): boolean {
+  // Pass the timestamp as a string -- SQLite's `||` would otherwise coerce
+  // the numeric param through REAL and render "1777369849.0".
+  return db.prepare(`
+    UPDATE agent_messages
+    SET result = 'stuck-alert sent at ' || ?
+    WHERE id = ?
+      AND status = 'delivered'
+      AND completed_at IS NULL
+  `).run(String(atSec), id).changes > 0
 }
 
 export function getActiveScheduledTaskCount(): { count: number; nextRun: number | null } {
@@ -1249,38 +1290,4 @@ export function getLatestAssistantMessage(userId: number, afterId: number): User
   return db.prepare(
     "SELECT * FROM user_chat_messages WHERE user_id = ? AND id > ? AND role = 'assistant' ORDER BY id ASC LIMIT 1"
   ).get(userId, afterId) as UserChatMessage | undefined
-}
-
-// --- Coordination Watchdog Queries ---
-
-export function getStuckDeliveredMessages(maxDeliveredAtSec: number, limit = 50): AgentMessage[] {
-  return db.prepare(`
-    SELECT m.* FROM agent_messages m
-    WHERE m.status = 'delivered'
-      AND m.completed_at IS NULL
-      AND m.delivered_at IS NOT NULL
-      AND m.delivered_at < ?
-      AND (m.result IS NULL OR (
-        m.result NOT LIKE 'stuck-alert sent at%'
-        AND m.result NOT LIKE 'closure-ack%'
-      ))
-      AND NOT EXISTS (
-        SELECT 1 FROM agent_messages r
-        WHERE r.from_agent = m.to_agent
-          AND r.to_agent = m.from_agent
-          AND r.created_at > m.delivered_at
-      )
-    ORDER BY m.delivered_at ASC
-    LIMIT ?
-  `).all(maxDeliveredAtSec, limit) as AgentMessage[]
-}
-
-export function markAgentMessageStuckAlerted(id: number, atSec: number): boolean {
-  return db.prepare(`
-    UPDATE agent_messages
-    SET result = 'stuck-alert sent at ' || ?
-    WHERE id = ?
-      AND status = 'delivered'
-      AND completed_at IS NULL
-  `).run(String(atSec), id).changes > 0
 }

@@ -110,7 +110,7 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
       throw err
     }
     const data = JSON.parse(body.toString()) as {
-      name: string; description: string; prompt: string; schedule: string; agent?: string; type?: string; skipIfBusy?: boolean
+      name: string; description: string; prompt: string; schedule: string; agent?: string; type?: string
     }
     const name = sanitizeScheduleName(data.name || '')
     if (!name) { json(res, { error: 'Name is required' }, 400); return true }
@@ -134,7 +134,6 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
       agent: data.agent || MAIN_AGENT_ID,
       enabled: true,
       type: data.type || 'task',
-      skipIfBusy: data.skipIfBusy === true,
     })
     logger.info({ name, schedule: data.schedule }, 'Scheduled task created')
     json(res, { ok: true, name })
@@ -158,7 +157,7 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
       throw err
     }
     const data = JSON.parse(body.toString()) as {
-      description?: string; prompt?: string; schedule?: string; agent?: string; enabled?: boolean; type?: string; skipIfBusy?: boolean
+      description?: string; prompt?: string; schedule?: string; agent?: string; enabled?: boolean
     }
     if (data.prompt !== undefined && data.prompt.length > MAX_SCHEDULED_TASK_PROMPT_LEN) {
       json(res, {

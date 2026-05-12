@@ -7,6 +7,8 @@ export interface UpdateCommit {
   message: string
   author: string
   date: string
+  files?: string[]
+  components?: string[]
 }
 
 export interface UpdateStatus {
@@ -14,9 +16,60 @@ export interface UpdateStatus {
   latest: string
   behind: number
   commits: UpdateCommit[]
+  components?: string[]
   remote: string
   lastChecked: number
   error?: string
+}
+
+const COMPONENT_RULES: [RegExp, string][] = [
+  [/^src\/web\/routes\//, 'API Routes'],
+  [/^src\/web\//, 'Dashboard Backend'],
+  [/^web-react\//, 'Dashboard UI'],
+  [/^web-legacy\//, 'Legacy UI'],
+  [/^scripts\//, 'Scripts'],
+  [/^agents\//, 'Agent Configs'],
+  [/^src\/__tests__\//, 'Tests'],
+  [/^src\//, 'Core'],
+  [/^package(-lock)?\.json$/, 'Dependencies'],
+  [/^\.mcp\.json$/, 'MCP Config'],
+]
+
+function deriveComponents(files: string[]): string[] {
+  const seen = new Set<string>()
+  for (const f of files) {
+    for (const [re, label] of COMPONENT_RULES) {
+      if (re.test(f)) { seen.add(label); break }
+    }
+  }
+  return [...seen]
+}
+
+function parseGitLogWithFiles(raw: string): UpdateCommit[] {
+  const commits: UpdateCommit[] = []
+  const entries = raw.split(/^COMMIT /m).filter(Boolean)
+  for (const entry of entries) {
+    const lines = entry.split('\n')
+    const header = lines[0] || ''
+    const pipeIdx = header.indexOf('|')
+    if (pipeIdx === -1) continue
+    const sha = header.slice(0, pipeIdx).trim()
+    const rest = header.slice(pipeIdx + 1)
+    const parts = rest.split('|')
+    if (parts.length < 3) continue
+    const [msg, author, date] = parts
+    const files = lines.slice(1).map(l => l.trim()).filter(Boolean)
+    commits.push({
+      sha,
+      short: sha.slice(0, 7),
+      message: (msg || '').split('\n')[0],
+      author: author || '',
+      date: date || '',
+      files,
+      components: deriveComponents(files),
+    })
+  }
+  return commits
 }
 
 let updateStatusCache: UpdateStatus = {
@@ -89,6 +142,7 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
       const cmp = await cmpRes.json() as {
         ahead_by?: number
         commits?: { sha: string; commit: { message: string; author: { name: string; date: string } } }[]
+        files?: { filename: string }[]
       }
       status.behind = cmp.ahead_by ?? 0
       // GitHub returns commits oldest-first; flip to newest-first for the UI.
@@ -100,9 +154,32 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
         author: c.commit.author?.name || '',
         date: c.commit.author?.date || '',
       }))
+      if (cmp.files && cmp.files.length > 0) {
+        const filenames = cmp.files.map(f => f.filename)
+        status.components = deriveComponents(filenames)
+      }
     } else if (cmpRes.status === 404) {
-      // Local HEAD not on the remote (detached local commit / different base).
-      status.error = 'Local HEAD not found on GitHub -- different fork or unpushed commits?'
+      // Local HEAD not on the remote; fall back to local git for commit list.
+      try {
+        execFileSync(
+          '/usr/bin/git',
+          ['fetch', 'origin', 'main', '--no-tags', '--quiet'],
+          { cwd: PROJECT_ROOT, timeout: 30_000, encoding: 'utf-8' },
+        )
+        const rawLog = execFileSync(
+          '/usr/bin/git',
+          ['log', '--name-only', '--pretty=format:COMMIT %H|%s|%an|%aI', 'HEAD..origin/main'],
+          { cwd: PROJECT_ROOT, timeout: 5_000, encoding: 'utf-8' },
+        ).trim()
+        const commits = parseGitLogWithFiles(rawLog)
+        status.commits = commits
+        status.behind = commits.length
+        // Aggregate components across all pending commits
+        const allFiles = commits.flatMap(c => c.files ?? [])
+        if (allFiles.length > 0) status.components = deriveComponents(allFiles)
+      } catch {
+        status.error = 'Local HEAD not found on GitHub -- different fork or unpushed commits?'
+      }
     }
   } catch (err) {
     status.error = err instanceof Error ? err.message : String(err)

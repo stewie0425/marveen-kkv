@@ -1,7 +1,7 @@
 import { execSync } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID } from '../config.js'
+import { MAIN_AGENT_ID, OWNER_NAME } from '../config.js'
 import {
   getPendingMessages,
   markMessageDelivered,
@@ -23,6 +23,9 @@ import {
   sendPromptToSession,
 } from './agent-process.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
+import { deliverAssistantReply } from './routes/user-chat.js'
+
+const WEB_USER_RE = /^web-user:(\d+)$/
 
 const TMUX = resolveFromPath('tmux')
 
@@ -51,6 +54,26 @@ export function startMessageRouter(): NodeJS.Timeout {
         routerLoggedMisses.delete(msg.id)
         continue
       }
+      // Web-user replies: deliver via SSE, no tmux involved.
+      const webUserMatch = WEB_USER_RE.exec(msg.to_agent)
+      if (webUserMatch) {
+        try {
+          deliverAssistantReply(parseInt(webUserMatch[1], 10), msg.content)
+          if (!markMessageDelivered(msg.id)) {
+            logger.warn({ id: msg.id }, 'markMessageDelivered affected 0 rows (deleted concurrently?)')
+          }
+          routerLoggedMisses.delete(msg.id)
+          logger.info({ id: msg.id, to: msg.to_agent }, 'Web-user reply delivered via SSE')
+        } catch (err) {
+          logger.warn({ err, id: msg.id }, 'Failed to deliver web-user reply')
+          if (!markMessageFailed(msg.id, 'SSE delivery failed')) {
+            logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+          }
+          routerLoggedMisses.delete(msg.id)
+        }
+        continue
+      }
+
       // The main agent runs in `${MAIN_AGENT_ID}-channels`, not `agent-${name}`,
       // so agentSessionName() would miss it and strand every sub-agent → main
       // message as pending forever. Mirror the scheduler's session resolution.
@@ -71,7 +94,18 @@ export function startMessageRouter(): NodeJS.Timeout {
         continue
       }
 
-      if (!isSessionReadyForPrompt(session)) {
+      // Priority bypass: operator-originated messages targeted at the main
+      // agent skip the busy-check. Symptom: when Marveen runs a long pending
+      // task (multi-minute Obsidian ingest, vault sync, etc) the queue backs
+      // up by 8-12min, so Kevin's kanban-comment forwards feel like they
+      // "never arrive" until he Telegram-pings. Telegram already bypasses the
+      // queue via the channels plugin, so the kanban path was the only slow
+      // surface for operator → main. Claude Code's input loop queues new
+      // prompts while a turn is in flight (won't break a tool call), making
+      // the inject safe even mid-task. Sub-agent → main and agent → agent
+      // still respect the busy-check to avoid noisy interruptions.
+      const isOperatorToMain = msg.from_agent === OWNER_NAME && isMainAgent
+      if (!isOperatorToMain && !isSessionReadyForPrompt(session)) {
         if (!routerLoggedMisses.has(msg.id)) {
           logger.warn({ id: msg.id, to: msg.to_agent, session }, 'Agent message target session busy, will retry')
           routerLoggedMisses.add(msg.id)

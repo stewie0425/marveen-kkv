@@ -1,18 +1,16 @@
-# 🩺 HEARTBEAT - 2026.03.03 11:00
+# 🩺 HEARTBEAT - 2026.05.10 12:00
 
 ## 📧 Email
-**⚠️ Deploy hiba** - hideghivas-oktatas-web Netlify build sikertelen (2x)
-**RoadRecord** - Házipénztár-ellenőrzés 2026 útmutató
-
-## 📅 Naptár
-**9:00 - Új esemény** (múltbéli, már lekéstél róla)
+Gmail MCP nem elérhető ebben a session-ben (csak OAuth flow tool, search_emails nincs). Email ellenőrzés kihagyva.
 
 ## 📋 Kanban
-Minden üres, nyugalom
+- **13 in_progress** (05.07-én 25 volt -- jelentős csökkkenés), 8 waiting, **1 urgent**
+- 🔴 URGENT: UniFi Network/Protect/Access mobil app nem elérhető (4G + belső LAN) -- több napja nyitott, nem zárult
+- ⏳ Waiting (8): Gottwald SSH root broken, Gottwald VM swap 99.8%, code-server GitLab auto-commit, HERE Technologies Sophia Carvajal email draft (SDK budget), UniFi Protect lassú stream relay vs LAN, FuelShield marketing videó (Yep Content), Smart Irrigation rendszer (Tölgyfa kert), Gottwald öntözés dashboard mobile fix (iOS)
 
 ## 💾 Rendszer
-- DB: 0.1 MB
-- Következő ütemezett: holnapi reggeli napindító (7:30)
+- DB: 5.7 MB (+1 MB 05.07 óta)
+- Aktív ütemezett feladat: 0
 
 ---
-*Brain the size of a planet, és itt vagyok, elmúlt eseményeket figyelve.*
+*42. Az UniFi urgent még mindig ott van. Waiting listán 2 új belépő. A in_progress massívan csökkent -- jó irány.*

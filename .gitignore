@@ -2,6 +2,10 @@
 node_modules/
 dist/
 
+# Marveen dashboard React rewrite -- in-progress migration. Stays out of
+# main until parity with the legacy web/ is reached and the cutover lands.
+web-react/
+
 # Secrets & personal data
 .env
 store/
@@ -19,9 +23,6 @@ reports/
 # Logs
 *.log
 *.pid
-
-# Test artifacts
-test-results/
 
 # macOS
 .DS_Store
@@ -45,3 +46,10 @@ claudeclaw.log
 
 # Local backup archives from scripts/backup.sh
 backups/
+
+# KKV product: exclude personal identity/soul files and Kevin-specific scripts
+SOUL.md
+scripts/ingest-kevin-vault.ts
+scripts/migrate-memories-to-rag.ts
+scripts/telegram-poll.sh
+web-legacy/

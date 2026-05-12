@@ -1,10 +1,28 @@
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { PROJECT_ROOT } from './config.js'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 
 const TYPING_REFRESH_MS = 4000
 import { logger } from './logger.js'
 
 const AGENT_TIMEOUT_MS = Number(process.env.MARVEEN_AGENT_TIMEOUT_MS) || 20 * 60 * 1000
+
+// The SDK auto-detects which @anthropic-ai/claude-agent-sdk-<platform> variant
+// to use, but on glibc Linux it sometimes picks the musl variant whose binary
+// is incompatible. Resolve the right one ourselves: prefer the gnu variant in
+// node_modules, then the user-installed CLI on PATH (~/.local/bin/claude).
+function resolveClaudeBinary(): string | undefined {
+  const fromEnv = process.env.CLAUDE_CODE_PATH?.trim()
+  if (fromEnv && existsSync(fromEnv)) return fromEnv
+  const candidates = [
+    join(PROJECT_ROOT, 'node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude'),
+    join(process.env.HOME || '/root', '.local/bin/claude'),
+    '/usr/local/bin/claude',
+  ]
+  return candidates.find(existsSync)
+}
+const CLAUDE_BINARY = resolveClaudeBinary()
 
 // When runAgent is called for pure text generation (CLAUDE.md / SOUL.md /
 // skill-md / prompt expansion / memory categorization), the model must not
@@ -17,9 +35,7 @@ export async function runAgent(
   message: string,
   sessionId?: string,
   onTyping?: () => void,
-  allowTools = false,
-  cwd: string = PROJECT_ROOT,
-  env?: Record<string, string | undefined>,
+  allowTools = false
 ): Promise<{ text: string | null; newSessionId?: string }> {
   let newSessionId: string | undefined
   let resultText: string | null = null
@@ -36,11 +52,11 @@ export async function runAgent(
       prompt: message,
       options: {
         abortController,
-        cwd,
+        cwd: PROJECT_ROOT,
         permissionMode: 'bypassPermissions',
+        ...(CLAUDE_BINARY ? { pathToClaudeCodeExecutable: CLAUDE_BINARY } : {}),
         ...(allowTools ? {} : { disallowedTools: DEFAULT_DISALLOWED_TOOLS }),
         ...(sessionId ? { resume: sessionId } : {}),
-        ...(env ? { env: { ...process.env, ...env } } : {}),
       },
     })
 

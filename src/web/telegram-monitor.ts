@@ -4,11 +4,10 @@ import { homedir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, BOT_NAME } from '../config.js'
+import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../config.js'
 import { agentDir, listAgentNames } from './agent-config.js'
 import {
   agentSessionName,
-  capturePane,
   isAgentRunning,
   isSessionReadyForPrompt,
   sendPromptToSession,
@@ -46,6 +45,37 @@ function getClaudePidForSession(session: string): number | null {
   }
 }
 
+// Read TELEGRAM_BOT_TOKEN from the channel .env file for a given pidDir.
+function readBotToken(pidDir: string): string | null {
+  const envPath = join(pidDir, '.env')
+  if (!existsSync(envPath)) return null
+  try {
+    for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
+      const t = line.trim()
+      if (t.startsWith('TELEGRAM_BOT_TOKEN=')) {
+        return t.slice('TELEGRAM_BOT_TOKEN='.length).trim() || null
+      }
+    }
+  } catch { /* unreadable */ }
+  return null
+}
+
+// Returns true if someone is actively polling the bot (Telegram returns 409
+// Conflict when another getUpdates call is already in flight). On network
+// error we optimistically return true to avoid false-positive dead detection.
+async function isBotPolling(token: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${token}/getUpdates?offset=-1&limit=1&timeout=2`,
+      { signal: AbortSignal.timeout(6000) },
+    )
+    const body = await res.json() as { error_code?: number }
+    return body.error_code === 409
+  } catch {
+    return true // network failure -- don't false-positive
+  }
+}
+
 function hasTelegramPluginAlive(claudePid: number, agentName?: string): boolean {
   try {
     const ps = execFileSync('/bin/ps', ['-axo', 'pid,ppid,command'], { timeout: 3000, encoding: 'utf-8' })
@@ -69,7 +99,11 @@ function hasTelegramPluginAlive(claudePid: number, agentName?: string): boolean 
       if (seen.has(p)) continue
       seen.add(p)
       const cmd = cmdOf.get(p) || ''
-      if (cmd.includes('/telegram/') && cmd.includes('bun')) return true
+      // The plugin is alive only if the actual `bun server.ts` poller is in
+      // the subtree. The `bun run` supervisor (whose argv carries the
+      // /telegram/ path) survives a server.ts crash for a window before
+      // exiting itself, so matching it alone gave a false-positive alive
+      // while polling was already dead.
       if (/\bbun\b/.test(cmd) && cmd.includes('server.ts')) return true
       for (const k of (childrenOf.get(p) || [])) stack.push(k)
     }
@@ -105,147 +139,49 @@ const agentLastRestart: Map<string, number> = new Map()
 const AGENT_RESTART_GRACE_MS = 90_000
 const PLUGIN_ALERT_DEDUP_MS = 30 * 60 * 1000
 
-// Marveen recovery is a 5-stage escalator:
-//   1. soft:   /mcp → navigate to Telegram → Reconnect (no session disruption)
-//   2. save:   ask Marveen to persist memory (~60s grace)
-//   3. resume: respawn claude with --continue (context preserved, MCPs reconnect)
-//   4. hard:   systemctl/launchctl restart (clean slate)
-//   5. gave_up: manual intervention
-type MarveenRecoveryStage = 'soft' | 'save' | 'resume' | 'hard' | 'gave_up'
+// Marveen recovery is a 4-stage escalator because killing the session
+// terminates the live Marveen conversation, so we try cheap fixes first.
+// The "save" stage gives Marveen one tick to persist hot/warm memory to
+// SQLite before we pull the rug, so the next session wakes up with the
+// last-moment context from the dying one.
+type MarveenRecoveryStage = 'soft' | 'save' | 'hard' | 'gave_up'
 interface MarveenDownState {
   downSince: number
   stage: MarveenRecoveryStage
   lastAlertAt: number
   softAttempts: number
+  // When we last transitioned to the current stage. Used by 'save' to
+  // honour the announced ~60s memory-save grace before jumping to 'hard'.
   stageStartedAt?: number
 }
 
 const SAVE_WINDOW_MS = 60_000
-// Confirmation threshold before treating a "plugin not alive" tick as real
-// downtime. The 30-min heartbeat scheduled task can monopolise the Claude
-// IPC for 60-90s while it processes the prompt, during which the plugin
-// IPC briefly looks dead. Two consecutive negative ticks (~120s) filter
-// those false positives without delaying real outages by much.
-const MARVEEN_DOWN_CONFIRM_MS = 120_000
-let marveenSuspectFirstSeen: number | null = null
 let marveenDownState: MarveenDownState | null = null
 
-// Navigate a Claude Code interactive picker by pressing Down until ❯ lands
-// on a line matching `pattern`. Uses the LAST ❯ in the pane since the
-// dialog renders below the prompt line (which also contains ❯).
-function navigateToMenuItem(session: string, pattern: RegExp, maxSteps: number = 10): boolean {
-  for (let i = 0; i < maxSteps; i++) {
-    const pane = capturePane(session)
-    if (!pane) return false
-    const lines = pane.split('\n')
-    let cursorLine: string | undefined
-    for (let j = lines.length - 1; j >= 0; j--) {
-      if (lines[j].includes('❯')) { cursorLine = lines[j]; break }
-    }
-    if (cursorLine && pattern.test(cursorLine)) return true
-    execFileSync(TMUX, ['send-keys', '-t', session, 'Down'], { timeout: 3000 })
-    execFileSync('/bin/sleep', ['0.15'], { timeout: 1000 })
-  }
-  return false
-}
-
-// Cached Telegram menu index; refreshed when the cache TTL expires or a
-// soft-reconnect fails the verification check (suggesting MCP list changed).
-let telegramMenuIndexCache: { idx: number; expiresAt: number } | null = null
-const TELEGRAM_INDEX_TTL_MS = 5 * 60 * 1000
-
-function getTelegramMenuIndex(forceRefresh = false): number {
-  const now = Date.now()
-  if (!forceRefresh && telegramMenuIndexCache && telegramMenuIndexCache.expiresAt > now) {
-    return telegramMenuIndexCache.idx
-  }
-  try {
-    const out = execFileSync('claude', ['mcp', 'list'], {
-      encoding: 'utf-8',
-      timeout: 15000,
-    })
-    const entries = out
-      .split('\n')
-      .filter((l) => /^[A-Za-z][^:]*:.*\s-\s/.test(l))
-    const idx = entries.findIndex((l) => /^plugin:telegram:telegram:/i.test(l))
-    telegramMenuIndexCache = { idx, expiresAt: now + TELEGRAM_INDEX_TTL_MS }
-    return idx
-  } catch (err) {
-    logger.warn({ err }, 'getTelegramMenuIndex: claude mcp list failed')
-    return -1
-  }
-}
-
 function softReconnectMarveen(): boolean {
-  // The /mcp picker highlights the selected entry with a background colour
-  // (not a `❯` prefix), so `tmux capture-pane -p` (ASCII) cannot read which
-  // row the cursor is on; with 25+ MCPs the viewport scrolls so the Telegram
-  // entry isn't visible from the default top position either. Strategy:
-  //   - The picker wraps around: pressing Up at the top jumps to the last
-  //     entry, and additional Ups walk backwards from there.
-  //   - We don't know exactly how far up the Telegram entry sits (the picker
-  //     order doesn't always match `claude mcp list`), so we brute-force
-  //     1..MAX Ups, opening the submenu after each step and checking whether
-  //     the header reads "Plugin:telegram:telegram MCP Server". On match we
-  //     proceed to Reconnect; on miss we Escape back to the picker and try
-  //     one more Up. PR #69 used a fixed 1-Up wraparound; this only worked
-  //     when Telegram was the very last entry, and broke silently as soon as
-  //     any new MCP (aiam-blog, server-*, etc.) got installed after it.
-  const MAX_UP_ATTEMPTS = 8
+  // /mcp opens Claude Code's MCP status dialog; a follow-up Enter picks
+  // the first action (Reconnect if the plugin is disconnected). We send
+  // Escape first in case a different dialog is already open.
+  //
+  // Guard: if the session is mid-turn (esc to interrupt on screen) or the
+  // operator has text parked in the input box, our Escape would interrupt
+  // their turn or wipe what they typed. In that case bail out -- the caller
+  // will retry on the next outage tick, by which point the pane is likely
+  // idle again.
+  if (!isSessionReadyForPrompt(MAIN_CHANNELS_SESSION)) {
+    logger.warn('Marveen soft reconnect skipped: main session busy or has pending input')
+    return false
+  }
   try {
-    // Escape interrupts any in-progress turn, making the session ready
     execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Escape'], { timeout: 3000 })
-    execFileSync('/bin/sleep', ['1'], { timeout: 2000 })
-
+    execFileSync('/bin/sleep', ['0.2'], { timeout: 1000 })
     execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, '/mcp', 'Enter'], { timeout: 3000 })
-    execFileSync('/bin/sleep', ['1'], { timeout: 3000 })
-
-    const pane1 = capturePane(MAIN_CHANNELS_SESSION)
-    if (!pane1) {
-      logger.warn('soft reconnect: failed to capture pane after /mcp')
-      execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Escape'], { timeout: 3000 })
-      return false
-    }
-
-    let matchedAt = -1
-    for (let upCount = 1; upCount <= MAX_UP_ATTEMPTS; upCount++) {
-      execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Up'], { timeout: 3000 })
-      execFileSync('/bin/sleep', ['0.2'], { timeout: 1000 })
-      execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Enter'], { timeout: 3000 })
-      execFileSync('/bin/sleep', ['1'], { timeout: 3000 })
-
-      const pane = capturePane(MAIN_CHANNELS_SESSION)
-      if (pane && /Plugin:telegram:telegram MCP Server/i.test(pane)) {
-        matchedAt = upCount
-        break
-      }
-      // Wrong submenu — Escape back to the picker and try the next Up
-      execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Escape'], { timeout: 3000 })
-      execFileSync('/bin/sleep', ['0.5'], { timeout: 1000 })
-    }
-
-    if (matchedAt < 0) {
-      logger.warn(
-        { maxUpAttempts: MAX_UP_ATTEMPTS },
-        'soft reconnect: did not find Telegram submenu within Up attempts',
-      )
-      execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Escape'], { timeout: 3000 })
-      return false
-    }
-    void getTelegramMenuIndex // silence unused warning while we keep the helper for future use
-
-    // Submenu cursor defaults to "❯ 1. View tools"; one Down → "2. Reconnect"
-    execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Down'], { timeout: 3000 })
     execFileSync('/bin/sleep', ['0.3'], { timeout: 1000 })
     execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Enter'], { timeout: 3000 })
-    execFileSync('/bin/sleep', ['2'], { timeout: 4000 })
-
-    execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Escape'], { timeout: 3000 })
-    logger.info({ matchedAt }, 'soft reconnect: /mcp → Up × N (telegram) → Enter → Down (Reconnect) → Enter completed')
+    logger.info('Marveen soft reconnect: sent /mcp + Enter')
     return true
   } catch (err) {
     logger.warn({ err }, 'Marveen soft reconnect failed')
-    try { execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Escape'], { timeout: 3000 }) } catch { /* */ }
     return false
   }
 }
@@ -271,42 +207,83 @@ function triggerMarveenMemorySave(): void {
   }
 }
 
-function resumeMarveenSession(): boolean {
-  try {
-    const claudeCmd = [
-      'export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"',
-      '&&', CLAUDE, '--continue', '--dangerously-skip-permissions',
-      '--channels plugin:telegram@claude-plugins-official',
-    ].join(' ')
-    execFileSync(TMUX, ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
-    logger.warn('Marveen session respawned with --continue')
-    return true
-  } catch (err) {
-    logger.error({ err }, 'Marveen session respawn failed')
-    return false
-  }
-}
-
-const RESUME_GRACE_MS = 90_000
 let marveenLastHardRestart = 0
 const MARVEEN_HARD_RESTART_GRACE_MS = 120_000
 
 export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
-  try {
-    if (process.platform === 'linux') {
-      const unit = `${MAIN_AGENT_ID}-channels.service`
-      execFileSync('/usr/bin/systemctl', ['--user', 'restart', unit], { timeout: 15000 })
-      logger.warn(`Hard restart: systemctl --user restart ${unit}`)
-    } else {
+  // Platform-specific restart. macOS uses launchctl + the LaunchAgent plist
+  // installed by install.sh; Linux uses a direct tmux respawn (mirrors the
+  // logic of scripts/channels.sh so behaviour matches a fresh boot).
+  if (process.platform === 'darwin') {
+    try {
       execFileSync('/bin/launchctl', ['unload', MAIN_CHANNELS_PLIST], { timeout: 5000 })
       execFileSync('/bin/sleep', ['2'], { timeout: 4000 })
       execFileSync('/bin/launchctl', ['load', MAIN_CHANNELS_PLIST], { timeout: 5000 })
+      marveenLastHardRestart = Date.now()
       logger.warn(`Hard restart: launchctl reload of com.${MAIN_AGENT_ID}.channels`)
+      return { ok: true }
+    } catch (err) {
+      logger.error({ err }, 'Hard restart failed (darwin/launchctl)')
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
+  }
+  // Linux: kill the tmux session AND any orphaned Marveen channels claude
+  // processes that survived a previous SIGHUP. The bun (telegram plugin)
+  // child of the orphan keeps polling the same bot token, so a fresh
+  // claude's bun would lose to it on 409 Conflict and never come up. We
+  // identify Marveen orphans by their argv: --channels with NO --model
+  // (sub-agents always carry --model X). Then respawn the session.
+  try {
+    try { execFileSync(TMUX, ['kill-session', '-t', MAIN_CHANNELS_SESSION], { timeout: 5000 }) } catch { /* may not exist */ }
+    execFileSync('/bin/sleep', ['1'], { timeout: 3000 })
+    // Walk ps for `claude --dangerously-skip-permissions --channels plugin:telegram@...`
+    // WITHOUT a --model flag (those are Marveen's signature; sub-agents have --model).
+    try {
+      const ps = execFileSync('/bin/ps', ['-eo', 'pid,args'], { timeout: 3000, encoding: 'utf-8' })
+      for (const line of ps.split('\n')) {
+        const m = line.match(/^\s*(\d+)\s+(.*)$/)
+        if (!m) continue
+        const args = m[2]
+        if (!args.includes('--channels plugin:telegram')) continue
+        if (!args.includes('--dangerously-skip-permissions')) continue
+        if (args.includes('--model ')) continue  // sub-agent, leave alone
+        const pid = parseInt(m[1], 10)
+        if (pid === process.pid) continue
+        try { process.kill(pid, 'SIGTERM') } catch { /* gone */ }
+        logger.warn({ pid }, 'Killed orphaned Marveen channels claude before respawn')
+      }
+    } catch { /* ps unavailable */ }
+    // Kill orphaned bun server.ts processes (reparented to init, ppid=1) from
+    // the previous session. These hold the bot token open, causing 409 Conflict
+    // in the new session's polling loop which silently exits without process.exit().
+    try {
+      const botPidPath = join(homedir(), '.claude', 'channels', 'telegram', 'bot.pid')
+      const currentBotPid = existsSync(botPidPath)
+        ? parseInt(readFileSync(botPidPath, 'utf-8').trim(), 10) : 0
+      const ps2 = execFileSync('/bin/ps', ['-axo', 'pid,ppid,command'], { timeout: 3000, encoding: 'utf-8' })
+      for (const line of ps2.split('\n')) {
+        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/)
+        if (!m) continue
+        const pid = parseInt(m[1], 10)
+        const ppid = parseInt(m[2], 10)
+        const cmd = m[3]
+        if (!/\bbun\b/.test(cmd) || !cmd.includes('server.ts')) continue
+        if (pid === currentBotPid) continue  // active bot, leave alone
+        if (ppid !== 1) continue             // not an orphan
+        try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
+        logger.warn({ pid }, 'Killed orphaned bun server.ts before Marveen respawn')
+      }
+    } catch { /* ps unavailable */ }
+    execFileSync('/bin/sleep', ['2'], { timeout: 4000 })
+    const home = process.env.HOME || '/root'
+    const sandboxEnv = process.env.IS_SANDBOX ? `IS_SANDBOX=${process.env.IS_SANDBOX} ` : 'IS_SANDBOX=1 '
+    const cmd = `${sandboxEnv}PATH=${home}/.bun/bin:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin ${CLAUDE} --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official`
+    execFileSync(TMUX, ['new-session', '-d', '-s', MAIN_CHANNELS_SESSION, '-c', PROJECT_ROOT, cmd], { timeout: 10000 })
     marveenLastHardRestart = Date.now()
+    logger.warn(`Hard restart: tmux respawn of ${MAIN_CHANNELS_SESSION}`)
     return { ok: true }
   } catch (err) {
-    logger.error({ err }, 'Hard restart failed')
+    logger.error({ err }, 'Hard restart failed (linux/tmux)')
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }
@@ -318,63 +295,56 @@ function handleMarveenDown(): void {
     return
   }
   if (!marveenDownState) {
-    // First tick of this outage: log + try the soft fix silently. We
-    // deliberately skip the user-facing Telegram alert at stage 1 since
-    // the Claude Code TUI does an hourly clean MCP re-handshake (sub-1-min
-    // disconnect that recovers automatically); spamming "lecsatlakozott"
-    // for those healthy cycles is more annoying than informative. Only
-    // alert from stage 2 onward, when soft reconnect failed and a real
-    // intervention (memory save / session resume / hard restart) starts.
+    // First tick of this outage: log, alert, try the soft fix.
     marveenDownState = { downSince: now, stage: 'soft', lastAlertAt: now, softAttempts: 0 }
-    logger.warn('Marveen Telegram plugin down -- stage 1 (soft /mcp reconnect, silent)')
-    if (softReconnectMarveen()) marveenDownState.softAttempts += 1
+    logger.warn('Marveen Telegram plugin down -- stage 1 (soft /mcp reconnect)')
+    sendMarveenAlert('⚠️ Marveen Telegram plugin lecsatlakozott. Próbálok /mcp-vel reconnectálni...').catch(() => {})
+    softReconnectMarveen()
+    marveenDownState.softAttempts += 1
     return
   }
   if (marveenDownState.stage === 'soft') {
-    if (marveenDownState.softAttempts < 3 && softReconnectMarveen()) {
+    // Retry soft reconnect up to 3 times total (counting both sent and
+    // skipped-because-busy attempts). Previously softAttempts only incremented
+    // when softReconnectMarveen() returned true, so a single "session busy"
+    // result caused immediate escalation to 'save' -- triggering unnecessary
+    // memory-save prompts and hard restarts while Marveen was mid-turn.
+    if (marveenDownState.softAttempts < 3) {
+      softReconnectMarveen()
       marveenDownState.softAttempts += 1
       marveenDownState.lastAlertAt = now
       return
     }
+    // Soft didn't help; ask Marveen to persist memory before we pull the plug.
     marveenDownState.stage = 'save'
     marveenDownState.stageStartedAt = now
     marveenDownState.lastAlertAt = now
     logger.warn('Marveen Telegram plugin still down -- stage 2 (memory save)')
-    sendMarveenAlert('⚠️ /mcp nem segített. Szólok Marveennek hogy mentsen memóriát session resume előtt (~60s türelmi idő).').catch(() => {})
+    sendMarveenAlert('⚠️ /mcp nem segített. Szólok Marveennek hogy mentsen memóriát hard restart előtt (~60s türelmi idő).').catch(() => {})
     triggerMarveenMemorySave()
     return
   }
   if (marveenDownState.stage === 'save') {
+    // Give the memory-save prompt a real ~60s window to land a turn before
+    // we hard-restart. Without this check, the next monitor tick (also 60s
+    // cadence, so effectively immediate) jumps straight to 'hard' and the
+    // save prompt either hasn't started or is mid-turn when we pull the plug.
     const saveStartedAt = marveenDownState.stageStartedAt ?? marveenDownState.downSince
     if (now - saveStartedAt < SAVE_WINDOW_MS) return
-    marveenDownState.stage = 'resume'
-    marveenDownState.stageStartedAt = now
-    marveenDownState.lastAlertAt = now
-    logger.warn('Marveen Telegram plugin still down -- stage 3 (session resume)')
-    sendMarveenAlert('⚠️ Memória mentés lejárt. Session resume (claude --continue) most...').catch(() => {})
-    resumeMarveenSession()
-    return
-  }
-  if (marveenDownState.stage === 'resume') {
-    const resumeStartedAt = marveenDownState.stageStartedAt ?? marveenDownState.downSince
-    if (now - resumeStartedAt < RESUME_GRACE_MS) return
     marveenDownState.stage = 'hard'
     marveenDownState.stageStartedAt = now
     marveenDownState.lastAlertAt = now
-    logger.warn('Marveen Telegram plugin still down -- stage 4 (hard restart)')
-    const svcName = process.platform === 'linux' ? 'systemctl' : 'launchctl'
-    sendMarveenAlert(`⚠️ Session resume nem segített. Hard restart (${svcName}) most a ${MAIN_CHANNELS_SESSION} session-ön...`).catch(() => {})
+    logger.warn('Marveen Telegram plugin still down -- stage 3 (hard restart)')
+    sendMarveenAlert(`⚠️ Memória mentés türelmi idő lejárt. Hard restart most a ${MAIN_CHANNELS_SESSION} session-ön (új session a SQLite memóriával indul).`).catch(() => {})
     hardRestartMarveenChannels()
     return
   }
   if (marveenDownState.stage === 'hard') {
+    // Hard didn't help either; give up, keep alerting.
     marveenDownState.stage = 'gave_up'
     marveenDownState.lastAlertAt = now
     logger.error('Marveen Telegram plugin still down after hard restart -- giving up auto-recovery')
-    const serviceCmd = process.platform === 'linux'
-      ? `\`systemctl --user status ${MAIN_AGENT_ID}-channels\``
-      : `\`launchctl list | grep ${MAIN_AGENT_ID}\``
-    sendMarveenAlert(`🚨 Hard restart SEM segített. Kézzel kell megnézni: \`tmux attach -t ${MAIN_CHANNELS_SESSION}\` és ${serviceCmd}.`).catch(() => {})
+    sendMarveenAlert(`🚨 Hard restart SEM segített. Kézzel kell megnézni: \`tmux attach -t ${MAIN_CHANNELS_SESSION}\` és \`launchctl list | grep ${MAIN_AGENT_ID}\`.`).catch(() => {})
     return
   }
   // gave_up -- re-alert at most every PLUGIN_ALERT_DEDUP_MS.
@@ -385,33 +355,52 @@ function handleMarveenDown(): void {
 }
 
 function handleMarveenUp(): void {
-  marveenSuspectFirstSeen = null
   if (marveenDownState) {
     const downedFor = Math.round((Date.now() - marveenDownState.downSince) / 1000)
     const stage = marveenDownState.stage
     logger.info({ stage, downedFor }, 'Marveen Telegram plugin recovered')
-    if (stage !== 'soft' && stage !== 'save' && stage !== 'resume') {
+    if (stage !== 'soft' && stage !== 'save') {
+      // Only alert on recovery if we actually pulled the session -- the soft
+      // and save stages don't destroy state, so a "recovered" message there
+      // would just be noise.
       sendMarveenAlert(`✅ Marveen Telegram plugin helyreállt (${stage} után, ${downedFor}s kiesés).`).catch(() => {})
     }
     marveenDownState = null
   }
 }
 
-// Returns true once the suspect-down state has been observed for
-// MARVEEN_DOWN_CONFIRM_MS. Called twice per minute (the monitor tick is
-// 60s); the threshold therefore translates to roughly two negative ticks
-// before recovery escalates.
-function shouldEscalateMarveenDown(): boolean {
-  const now = Date.now()
-  if (marveenSuspectFirstSeen === null) {
-    marveenSuspectFirstSeen = now
-    return false
-  }
-  return now - marveenSuspectFirstSeen >= MARVEEN_DOWN_CONFIRM_MS
-}
+// Down-detection debounce. A single tick where `ps -axo` times out under
+// load, or where tmux briefly fails to list a pane, used to be enough to
+// flip a healthy session into the recovery flow and trigger a needless
+// hard restart (which costs Marveen its in-context state). Require N
+// consecutive failing ticks before escalating.
+const DOWN_TICKS_REQUIRED = 2
+const downTickCount: Map<string, number> = new Map()
+
+// Boot grace window. When the dashboard itself restarts (npm run build +
+// kill+respawn, or update.sh-driven self-restart), the 60s probe tick is
+// missed — and the streak counter restarts on the new dashboard. If the
+// underlying claude session was already mid-recovery when we went down,
+// the new dashboard sees N consecutive failing ticks and immediately
+// escalates, even though some of those failures are dashboard-side
+// observation gaps, not plugin-side outages. During this window we only
+// WARN; escalation only kicks in once Marveen has had a chance to settle.
+const BOOT_GRACE_WINDOW_MS = 90_000
+const monitorBootTime = Date.now()
 
 export function startTelegramPluginMonitor(): NodeJS.Timeout {
-  function check() {
+  let checkInProgress = false
+  async function check() {
+    if (checkInProgress) return
+    checkInProgress = true
+    try {
+      await checkInner()
+    } finally {
+      checkInProgress = false
+    }
+  }
+  async function checkInner() {
+    const inBootGrace = Date.now() - monitorBootTime < BOOT_GRACE_WINDOW_MS
     type Target = { session: string; isMarveen: boolean; agentName?: string }
     const targets: Target[] = [{ session: MAIN_CHANNELS_SESSION, isMarveen: true }]
     for (const a of listAgentNames()) {
@@ -419,21 +408,33 @@ export function startTelegramPluginMonitor(): NodeJS.Timeout {
     }
     for (const t of targets) {
       const claudePid = getClaudePidForSession(t.session)
-      if (!claudePid) {
-        // Grace period: we may have just restarted this agent and the
-        // claude process hasn't appeared yet. Don't escalate until boot
-        // has had a realistic chance to complete.
-        if (!t.isMarveen && t.agentName) {
-          const lastRestart = agentLastRestart.get(t.agentName)
-          if (lastRestart && Date.now() - lastRestart < AGENT_RESTART_GRACE_MS) continue
+      const noClaude = !claudePid
+      const processAlive = !noClaude && hasTelegramPluginAlive(claudePid!, t.agentName)
+      let tickIsDown = noClaude || !processAlive
+
+      // Fix B: if process looks alive, verify it's actually polling the Telegram
+      // API. A 409 Conflict means an active poller holds the token; any other
+      // response (200/OK or network error) means the grammy loop silently exited
+      // (return instead of process.exit(1)) -- the "silent death" pattern.
+      if (!tickIsDown && !noClaude) {
+        const pidDir = t.agentName
+          ? join(agentDir(t.agentName), '.claude', 'channels', 'telegram')
+          : join(homedir(), '.claude', 'channels', 'telegram')
+        const token = readBotToken(pidDir)
+        if (token) {
+          const polling = await isBotPolling(token)
+          if (!polling) {
+            logger.warn({ session: t.session, agentName: t.agentName },
+              'Telegram plugin process alive but not polling (silent death detected)')
+            tickIsDown = true
+          }
         }
-        if (t.isMarveen) {
-          if (shouldEscalateMarveenDown()) handleMarveenDown()
-        }
-        continue
       }
-      const alive = hasTelegramPluginAlive(claudePid, t.agentName)
-      if (alive) {
+
+      if (!tickIsDown) {
+        // Healthy tick. Clear any pending failure streak and run the
+        // recovered-path side effects.
+        downTickCount.delete(t.session)
         if (t.isMarveen) {
           handleMarveenUp()
         } else if (agentDownSince.has(t.session)) {
@@ -442,14 +443,56 @@ export function startTelegramPluginMonitor(): NodeJS.Timeout {
         }
         continue
       }
-      // Same grace period on the plugin-not-yet-connected path: the MCP
-      // handshake can take tens of seconds after a fresh claude start.
+
+      // Grace period: we may have just restarted this agent and the claude
+      // process or its MCP child hasn't connected yet. Don't escalate until
+      // boot has had a realistic chance to complete.
       if (!t.isMarveen && t.agentName) {
         const lastRestart = agentLastRestart.get(t.agentName)
         if (lastRestart && Date.now() - lastRestart < AGENT_RESTART_GRACE_MS) continue
       }
+
+      // Debounce: require DOWN_TICKS_REQUIRED consecutive failing ticks
+      // before triggering the recovery flow. Earlier ticks just count.
+      // The debounce gate only protects the *initial* escalation -- once a
+      // marveenDownState exists, the recovery state machine needs every
+      // failing tick fed to it so it can advance soft -> save -> hard. If
+      // we kept gating ticks behind the debounce after the state machine
+      // was already engaged, every other tick would be lost to "streak=1"
+      // and stages would only advance every other tick (5+ ticks to reach
+      // hard restart). For non-Marveen agents we still apply the debounce
+      // unconditionally because they restart via stop/start, no state machine.
+      const streak = (downTickCount.get(t.session) ?? 0) + 1
+      downTickCount.set(t.session, streak)
+      const stateMachineActive = t.isMarveen && marveenDownState !== null
+      if (streak < DOWN_TICKS_REQUIRED && !stateMachineActive) {
+        logger.warn(
+          { session: t.session, streak, claudeMissing: noClaude },
+          'Telegram plugin down tick (debouncing — not yet escalating)',
+        )
+        continue
+      }
+
+      // Boot grace window: the streak just hit its escalation threshold,
+      // but the dashboard has been running for less than the grace period.
+      // Don't escalate yet — observation could be coloured by tick gaps
+      // around the dashboard's own restart. Keep the streak frozen at the
+      // threshold so when grace expires AND the next tick is still down,
+      // we escalate immediately rather than waiting for another full
+      // round of debounce.
+      if (inBootGrace) {
+        downTickCount.set(t.session, DOWN_TICKS_REQUIRED)
+        logger.warn(
+          { session: t.session, streak, msSinceBoot: Date.now() - monitorBootTime },
+          'Telegram plugin down tick (in dashboard boot grace window — deferring escalation)',
+        )
+        continue
+      }
+
+      // Streak met and grace expired: escalate.
+      downTickCount.delete(t.session)
       if (t.isMarveen) {
-        if (shouldEscalateMarveenDown()) handleMarveenDown()
+        handleMarveenDown()
       } else {
         if (!agentDownSince.has(t.session)) agentDownSince.set(t.session, Date.now())
         logger.warn({ agent: t.agentName }, 'Agent Telegram plugin down -- auto-restarting')

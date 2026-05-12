@@ -105,14 +105,18 @@ if ! command -v claude &>/dev/null; then
 fi
 echo -e "  ${GREEN}✓${NC} Claude Code CLI"
 
-# Step 2: Claude Code first-run flags (BEFORE auth login)
-#
-# Reason: ha a `claude auth login` browser-flow megakad (timeout, Ctrl+C,
-# vagy a felhasznalo nem klikkel a "Trust this browser?"-ben), a `set -e`
-# alatt a script kilep es a flag-set NEM fut le -- onnantol a tmux-spawned
-# headless session orokre parkol a "Trust this folder" / theme-picker /
-# Bypass Permissions promptokon. Tehat a flag-set FOLY-RA `auth login`
-# ELOTT, hogy ezek a defensive default-ok mindenkeppen a helyukre keruljenek.
+# Step 2: Claude authentication
+echo ""
+echo -e "${BOLD}[2/7] Claude bejelentkezes${NC}"
+echo -e "${DIM}  Ha meg nem jelentkeztel be, most megteheted.${NC}"
+read -p "  Szeretned most bejelentkezni? (i/n) " DO_AUTH
+if [ "$DO_AUTH" = "i" ]; then
+  claude auth login
+fi
+
+# Mark the Claude Code first-run wizard as completed so the tmux-spawned
+# `claude --channels ...` process doesn't stop on the theme picker and
+# block the Telegram plugin from ever initializing.
 mkdir -p "$HOME/.claude"
 python3 - <<'PYEOF'
 import json, os, pathlib
@@ -132,6 +136,12 @@ try:
 except Exception:
     pass
 PYEOF
+
+# Pre-accept the --dangerously-skip-permissions confirmation dialog so the
+# headless `claude --channels ...` session in scripts/channels.sh doesn't
+# park on it forever (the dialog needs interactive Enter and there's no TTY
+# attached). Claude Code maintains this flag itself once accepted manually,
+# but we have to seed it before the first launchd-spawned session.
 python3 - <<'PYEOF'
 import json, os, pathlib
 p = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
@@ -149,25 +159,6 @@ try:
 except Exception:
     pass
 PYEOF
-echo -e "  ${GREEN}✓${NC} Claude Code first-run flags pre-set"
-
-# Step 2b: Claude authentication (kept tolerant -- ha megakad, folytatjuk)
-echo ""
-echo -e "${BOLD}[2/7] Claude bejelentkezes${NC}"
-echo -e "${DIM}  Ha meg nem jelentkeztel be, most megteheted.${NC}"
-echo -e "${DIM}  Ha a browser-os authorize-flow megakad, Ctrl+C-vel kilephetsz${NC}"
-echo -e "${DIM}  -- a telepites folytatodik, kesobb manualisan tudsz belepni.${NC}"
-read -p "  Szeretned most bejelentkezni? (i/n) " DO_AUTH
-if [ "$DO_AUTH" = "i" ]; then
-  set +e
-  claude auth login
-  AUTH_RC=$?
-  set -e
-  if [ "$AUTH_RC" -ne 0 ]; then
-    echo -e "  ${ORANGE}⚠${NC} Auth login nem fejezodott be sikeresen (exit $AUTH_RC)."
-    echo -e "  ${DIM}A telepites folytatodik. Belepheted kesobb: ${BOLD}claude auth login${NC}"
-  fi
-fi
 echo -e "  ${GREEN}✓${NC} Claude Code first-run beallitas kesz"
 
 # Step 3: Personal info
@@ -259,33 +250,6 @@ if [ -f "$INSTALL_DIR/templates/SOUL.md.template" ] && [ ! -f "$INSTALL_DIR/SOUL
       -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
       "$INSTALL_DIR/templates/SOUL.md.template" > "$INSTALL_DIR/SOUL.md"
   echo -e "  ${GREEN}✓${NC} SOUL.md generalva"
-fi
-
-# Scaffold default scheduled tasks into ~/.claude/scheduled-tasks/. Templates
-# carry {{MAIN_AGENT_ID}} placeholders so tasks target the user's chosen agent
-# slug rather than hardcoded "marveen". Skip task dirs that already exist --
-# never overwrite user customizations.
-SCHED_TPL_DIR="$INSTALL_DIR/templates/scheduled-tasks"
-SCHED_TARGET_DIR="$HOME/.claude/scheduled-tasks"
-if [ -d "$SCHED_TPL_DIR" ]; then
-  mkdir -p "$SCHED_TARGET_DIR"
-  for tpl in "$SCHED_TPL_DIR"/*/; do
-    [ -d "$tpl" ] || continue
-    task_name=$(basename "$tpl")
-    target="$SCHED_TARGET_DIR/$task_name"
-    if [ -d "$target" ]; then
-      continue
-    fi
-    mkdir -p "$target"
-    for f in "$tpl"*; do
-      [ -f "$f" ] || continue
-      sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
-          -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
-          -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
-          "$f" > "$target/$(basename "$f")"
-    done
-    echo -e "  ${GREEN}✓${NC} Utemezett feladat scaffoldolva: $task_name"
-  done
 fi
 
 # Setup Telegram channel

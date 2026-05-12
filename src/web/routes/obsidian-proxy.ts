@@ -18,7 +18,7 @@ import { logger } from '../../logger.js'
 import { json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
-const OBSIDIAN_URL = 'https://10.92.0.185:27124'
+const OBSIDIAN_URL = process.env.OBSIDIAN_URL ?? 'https://localhost:27124'
 const TOKEN_ENV_FILE = '/etc/marveen/obsidian-rest.env'
 const OBSIDIAN_TIMEOUT_MS = 8_000
 

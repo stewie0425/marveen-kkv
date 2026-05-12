@@ -1,10 +1,11 @@
 import {
-  saveAgentMemory, getAgentMemories, searchAgentMemories, getMemoryStats, updateMemory,
-  hybridSearch, backfillEmbeddings,
-  searchMemories, getMemoriesForChat, getDb,
+  saveAgentMemory,
+  backfillEmbeddings,
+  getDb,
   type Memory,
 } from '../../db.js'
-import { MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL } from '../../config.js'
+import { getMemoryBackend, type MemoryCategory } from '../../memory/backend.js'
+import { MAIN_AGENT_ID, OLLAMA_URL } from '../../config.js'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
@@ -28,13 +29,14 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
       json(res, { error: `Invalid category "${category}". Allowed: ${[...MEMORY_CATEGORIES].join(', ')}` }, 400)
       return true
     }
-    const result = saveAgentMemory(
-      data.agent_id || MAIN_AGENT_ID,
-      data.content.trim(),
-      category,
-      data.keywords || undefined,
-      true
-    )
+    const backend = await getMemoryBackend()
+    const result = await backend.saveMemory({
+      agent_id: data.agent_id || MAIN_AGENT_ID,
+      content: data.content.trim(),
+      category: category as MemoryCategory,
+      keywords: data.keywords || undefined,
+      auto_generated: true,
+    })
     json(res, { ok: true, id: result.id })
     return true
   }
@@ -44,28 +46,22 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
     const agentId = url.searchParams.get('agent') || ''
     const tier = url.searchParams.get('tier') || url.searchParams.get('category') || ''
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200)
-    const mode = url.searchParams.get('mode') || 'fts'
+    const mode = (url.searchParams.get('mode') || 'fts') === 'hybrid' ? 'hybrid' : 'fts'
 
-    let results: Memory[]
-    if (q && mode === 'hybrid') {
-      results = await hybridSearch(agentId || MAIN_AGENT_ID, q, limit)
-    } else if (q && agentId) {
-      results = searchAgentMemories(agentId, q, limit)
-      if (results.length === 0) {
-        const db2 = getDb()
-        results = db2.prepare("SELECT * FROM memories WHERE (agent_id = ? OR category = 'shared') AND (content LIKE ? OR keywords LIKE ?) ORDER BY accessed_at DESC LIMIT ?")
-          .all(agentId, `%${q}%`, `%${q}%`, limit) as Memory[]
-      }
-    } else if (q) {
-      results = searchMemories(q, ALLOWED_CHAT_ID, limit)
-      if (results.length === 0) {
-        const db2 = getDb()
-        results = db2.prepare('SELECT * FROM memories WHERE content LIKE ? ORDER BY accessed_at DESC LIMIT ?').all(`%${q}%`, limit) as Memory[]
-      }
-    } else if (agentId) {
-      results = getAgentMemories(agentId, limit)
-    } else {
-      results = getMemoriesForChat(ALLOWED_CHAT_ID, limit)
+    const backend = await getMemoryBackend()
+    const effectiveAgent = agentId || MAIN_AGENT_ID
+    let results = q
+      ? await backend.searchMemories(effectiveAgent, q, limit, mode)
+      : await backend.getMemoriesForAgent(effectiveAgent, limit)
+
+    // SQLite-only fallback: when FTS finds nothing, the legacy code did a
+    // LIKE pass on content+keywords. RAG already runs a relaxed match
+    // server-side, so this only kicks in for the sqlite backend.
+    if (q && results.length === 0 && backend.kind === 'sqlite' && agentId) {
+      const db2 = getDb()
+      const rows = db2.prepare("SELECT * FROM memories WHERE (agent_id = ? OR category = 'shared') AND (content LIKE ? OR keywords LIKE ?) ORDER BY accessed_at DESC LIMIT ?")
+        .all(agentId, `%${q}%`, `%${q}%`, limit) as Memory[]
+      results = rows.map(m => ({ ...m, category: m.category as MemoryCategory }))
     }
 
     if (tier) results = results.filter(m => m.category === tier)
@@ -182,6 +178,14 @@ Respond ONLY with JSON, nothing else:
   }
 
   if (path === '/api/memories/backfill' && method === 'POST') {
+    // Backfill is an SQLite-specific maintenance op (Ollama embeddings into
+    // memories.embedding). The RAG service runs its own embedding pipeline,
+    // so this endpoint is unavailable in rag mode.
+    const backend = await getMemoryBackend()
+    if (backend.kind !== 'sqlite') {
+      json(res, { error: 'backfill is only available with MARVEEN_MEMORY_BACKEND=sqlite' }, 501)
+      return true
+    }
     try {
       const count = await backfillEmbeddings()
       json(res, { ok: true, count })
@@ -193,25 +197,41 @@ Respond ONLY with JSON, nothing else:
   }
 
   if (path === '/api/memories/stats' && method === 'GET') {
-    json(res, getMemoryStats())
+    const backend = await getMemoryBackend()
+    json(res, await backend.getStats())
     return true
   }
 
-  const memUpdateMatch = path.match(/^\/api\/memories\/(\d+)$/)
+  // Allow uuid string ids for the rag backend; sqlite ids are pure digits.
+  const memUpdateMatch = path.match(/^\/api\/memories\/([^/]+)$/)
   if (memUpdateMatch && method === 'PUT') {
-    const id = parseInt(memUpdateMatch[1], 10)
+    const rawId = memUpdateMatch[1]
+    const id: number | string = /^\d+$/.test(rawId) ? parseInt(rawId, 10) : rawId
     const body = await readBody(req)
     const { content, category, tier, agent_id, keywords } = JSON.parse(body.toString()) as { content: string; category?: string; tier?: string; agent_id?: string; keywords?: string }
-    if (updateMemory(id, content, tier || category, agent_id, keywords)) { json(res, { ok: true }); return true }
+    const cat = (tier || category)?.toLowerCase()
+    if (cat && !MEMORY_CATEGORIES.has(cat)) {
+      json(res, { error: `Invalid category "${cat}"` }, 400)
+      return true
+    }
+    const backend = await getMemoryBackend()
+    const ok = await backend.updateMemory(id, {
+      content,
+      category: cat as MemoryCategory | undefined,
+      agent_id,
+      keywords,
+    })
+    if (ok) { json(res, { ok: true }); return true }
     json(res, { error: 'Memory not found' }, 404)
     return true
   }
 
   if (memUpdateMatch && method === 'DELETE') {
-    const id = parseInt(memUpdateMatch[1], 10)
-    const db2 = getDb()
-    const changes = db2.prepare('DELETE FROM memories WHERE id = ?').run(id).changes
-    if (changes > 0) { json(res, { ok: true }); return true }
+    const rawId = memUpdateMatch[1]
+    const id: number | string = /^\d+$/.test(rawId) ? parseInt(rawId, 10) : rawId
+    const backend = await getMemoryBackend()
+    const ok = await backend.deleteMemory(id)
+    if (ok) { json(res, { ok: true }); return true }
     json(res, { error: 'Memory not found' }, 404)
     return true
   }

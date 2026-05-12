@@ -12,13 +12,29 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
 
   if (path === '/api/messages' && method === 'POST') {
     const body = await readBody(req)
-    const { from, to, content } = JSON.parse(body.toString()) as { from: string; to: string; content: string }
+    const { from, to, content, closure_ack } = JSON.parse(body.toString()) as {
+      from: string
+      to: string
+      content: string
+      // Set to true on fire-and-forget thank-you / standby / FYI messages
+      // that the recipient has nothing to reply to. Pre-stamps the row so
+      // the stuck-coordination watchdog never alerts on it after 5min.
+      closure_ack?: boolean
+    }
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
       json(res, { error: 'from, to, and content are required' }, 400)
       return true
     }
-    const msg = createAgentMessage(from.trim(), to.trim(), content.trim())
-    logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
+    const msg = createAgentMessage(
+      from.trim(),
+      to.trim(),
+      content.trim(),
+      { closureAck: closure_ack === true },
+    )
+    logger.info(
+      { id: msg.id, from: msg.from_agent, to: msg.to_agent, closure_ack: closure_ack === true },
+      'Agent message created',
+    )
     json(res, msg)
     return true
   }

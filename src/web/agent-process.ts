@@ -1,16 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
 import { OLLAMA_URL } from '../config.js'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
 import { detectPaneState } from '../pane-state.js'
-import { agentDir, readAgentModel, readAgentSecurityProfile, readAgentClaudeConfigDir } from './agent-config.js'
+import { agentDir, readAgentModel, readAgentSecurityProfile } from './agent-config.js'
 import { parseTelegramToken } from './telegram.js'
 import { loadProfileTemplate } from './profiles.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
-import { getSecret } from './vault.js'
 
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude')
@@ -47,43 +45,22 @@ export function startAgentProcess(name: string): { ok: boolean; pid?: number; er
     } catch { /* ok */ }
 
     const model = readAgentModel(name)
-    const isClaude = model.startsWith('claude-')
-    const isDeepseek = model.startsWith('deepseek-')
-    const isOllama = !isClaude && !isDeepseek
+    const isOllama = !model.startsWith('claude-')
     const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && ` : ''
-    // DeepSeek's /anthropic base URL accepts the literal Anthropic SDK
-    // request format, so Claude Code talks to it as if it were Anthropic.
-    // We pull the API key from the encrypted vault (entry id: DEEPSEEK_API_KEY)
-    // rather than process.env so operators can rotate it from the dashboard
-    // without restarting. We do NOT fail-fast on missing key here -- a 401
-    // from the upstream gives a clearer signal in the agent's tmux pane
-    // than a pre-flight error string the operator would have to dig out of logs.
-    const deepseekKey = isDeepseek ? (getSecret('DEEPSEEK_API_KEY') ?? '') : ''
-    const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && ` : ''
     // Apply security profile: write allow/deny list into settings.json, and
     // skip the dangerously-skip-permissions flag for strict profiles so
     // Claude Code enforces the list rather than bypassing it.
     const profile = loadProfileTemplate(readAgentSecurityProfile(name))
     writeAgentSettingsFromProfile(name, profile)
     const skipFlag = profile.permissionMode === 'strict' ? '' : '--dangerously-skip-permissions '
-    // Optional per-agent CLAUDE_CONFIG_DIR (alternate Claude Code config dir,
-    // e.g. for routing this agent to a separate Anthropic login). When the
-    // agent-config field is missing or blank, claudeConfigDir is null and we
-    // emit no export, preserving the default Claude Code behavior.
-    const claudeConfigDir = readAgentClaudeConfigDir(name)
-    const claudeConfigEnv = claudeConfigDir ? `export CLAUDE_CONFIG_DIR="${claudeConfigDir}" && ` : ''
-    // `--continue` requires an existing session; on a brand-new agent the
-    // Claude Code projects directory does not yet exist and `claude` exits
-    // immediately with an obscure "No deferred tool marker found" error
-    // that is silent inside tmux. Detect first launch by probing for the
-    // encoded project dir and skip `--continue` only then. The encoding
-    // mirrors Claude Code's own scheme: replace every `/` with `-`.
-    const projectsRoot = claudeConfigDir
-      ? join(claudeConfigDir, 'projects')
-      : join(homedir(), '.claude', 'projects')
-    const encodedProject = dir.replace(/\//g, '-')
-    const hasPriorSession = existsSync(join(projectsRoot, encodedProject))
-    const continueFlag = hasPriorSession ? '--continue ' : ''
+    // Recent claude CLI (2.1.119+) refuses --dangerously-skip-permissions
+    // when running as root unless IS_SANDBOX is set. Existing agents that
+    // started under older claude builds keep running fine, but every
+    // subsequent restart hits this gate. Mirror the pattern already used
+    // by hardRestartMarveenChannels so agent-spawn is consistent.
+    const sandboxEnv = process.env.IS_SANDBOX
+      ? `export IS_SANDBOX=${process.env.IS_SANDBOX} && `
+      : 'export IS_SANDBOX=1 && '
     // bun lives under ~/.bun/bin, which isn't in the dashboard's launchd PATH.
     // The Claude plugin launcher spawns `bun`, so we must prepend it here.
     // Defensive unset of TELEGRAM_BOT_TOKEN: if anything ever pollutes the
@@ -91,37 +68,13 @@ export function startAgentProcess(name: string): { ok: boolean; pid?: number; er
     // sourcing .env), the sub-agent would otherwise inherit the main
     // agent's token and trigger a 409 Conflict loop. The per-agent .env
     // in TELEGRAM_STATE_DIR is still the intended source of truth.
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && unset TELEGRAM_BOT_TOKEN && export TELEGRAM_STATE_DIR="${tgStateDir}" && ${claudeConfigEnv}${ollamaEnv}${deepseekEnv}cd "${dir}" && ${CLAUDE} ${continueFlag}${skipFlag}--model ${model} --channels plugin:telegram@claude-plugins-official`
+    const cmd = `${sandboxEnv}export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && unset TELEGRAM_BOT_TOKEN && export TELEGRAM_STATE_DIR="${tgStateDir}" && ${ollamaEnv}cd "${dir}" && ${CLAUDE} ${skipFlag}--model ${model} --channels plugin:telegram@claude-plugins-official`
     execSync(
       `${TMUX} new-session -d -s ${session} "${cmd}"`,
       { timeout: 10000 }
     )
 
     logger.info({ name, session, tgStateDir }, 'Agent tmux session started')
-
-    // After a restart with --continue, a session that's been idle for >24h
-    // shows the "Resume from summary" modal before the prompt input is ready
-    // (113.6k tokens at 2d age in observed cases). Until the operator either
-    // sends a new prompt or dismisses the modal, every scheduled task and
-    // every inter-agent message stalls because isSessionReadyForPrompt sees
-    // a non-idle pane state. The pre-flight dismiss baked into
-    // sendPromptToSession only fires on outgoing traffic -- so on a fresh
-    // restart with no inbound, the modal can sit indefinitely.
-    //
-    // Fire a delayed dismiss after Claude Code has had time to render the
-    // modal. 8 seconds is a comfortable margin in observed restarts (modal
-    // typically appears within 4-6s). Survey-rating modals from prior
-    // sessions can also be present, so dismiss both. Errors are swallowed
-    // -- the outbound pre-flight remains the safety net if this misses.
-    setTimeout(() => {
-      try {
-        dismissSurveyModalIfPresent(session)
-        dismissResumeSummaryModalIfPresent(session)
-      } catch (err) {
-        logger.warn({ err, name, session }, 'Post-restart modal dismiss failed')
-      }
-    }, 8000)
-
     return { ok: true }
   } catch (err) {
     logger.error({ err, name }, 'Failed to start agent tmux session')
@@ -167,59 +120,10 @@ export function getAgentProcessInfo(name: string): { running: boolean; session?:
   }
 }
 
-// Claude Code occasionally pops a "How is Claude doing this session? (optional)"
-// rating modal above the prompt input. The footer line still reads
-// "bypass permissions on (shift+tab to cycle)" so detectPaneState() classifies
-// the pane as idle, but the modal swallows the next keystroke and pinches off
-// every scheduled prompt + agent message until a human dismisses it. We strip
-// it pre-flight by sending "0" (Dismiss) when the marker is visible, so any
-// caller writing a prompt has a clear input field.
-const SURVEY_MODAL_RX = /How is Claude doing this session/
-
-function dismissSurveyModalIfPresent(session: string): void {
-  try {
-    const pane = execSync(`${TMUX} capture-pane -t ${session} -p`, { timeout: 3000, encoding: 'utf-8' })
-    if (!SURVEY_MODAL_RX.test(pane)) return
-    execFileSync(TMUX, ['send-keys', '-t', session, '0'], { timeout: 5000 })
-    // Modal close is one frame; settle window so the next send-keys lands in
-    // the prompt input, not the now-stale modal handler.
-    execFileSync('/bin/sleep', ['0.3'], { timeout: 2000 })
-    logger.info({ session }, 'Dismissed Claude Code session-rating modal before sending prompt')
-  } catch (err) {
-    logger.warn({ err, session }, 'Failed to probe/dismiss session-rating modal')
-  }
-}
-
-// When a session approaches its context limit Claude Code shows a "Resume from
-// summary" modal with three numbered options and footer "Enter to confirm".
-// detectPaneState() reads that footer as 'unknown' (not the usual "bypass
-// permissions" string), so isSessionReadyForPrompt() refuses to deliver and
-// every scheduled task / inter-agent message piles up behind it. Pre-flight
-// pick option 1 (Resume from summary, recommended) and Enter to confirm.
-const RESUME_SUMMARY_MODAL_RX = /Resume from summary/
-
-function dismissResumeSummaryModalIfPresent(session: string): void {
-  try {
-    const pane = execSync(`${TMUX} capture-pane -t ${session} -p`, { timeout: 3000, encoding: 'utf-8' })
-    if (!RESUME_SUMMARY_MODAL_RX.test(pane)) return
-    execFileSync(TMUX, ['send-keys', '-t', session, '1'], { timeout: 5000 })
-    execFileSync('/bin/sleep', ['0.1'], { timeout: 2000 })
-    execFileSync(TMUX, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
-    // /compact starts immediately and can run for minutes; we only need to
-    // unblock the modal so detectPaneState can transition off 'unknown'.
-    execFileSync('/bin/sleep', ['0.3'], { timeout: 2000 })
-    logger.info({ session }, 'Dismissed Claude Code resume-from-summary modal before sending prompt')
-  } catch (err) {
-    logger.warn({ err, session }, 'Failed to probe/dismiss resume-from-summary modal')
-  }
-}
-
 // Send text to a tmux session as if typed at the prompt.
 // Uses execFileSync so callers can pass raw text -- tmux send-keys -l treats
 // the argument as literal characters, bypassing shell quoting entirely.
 export function sendPromptToSession(session: string, text: string): void {
-  dismissSurveyModalIfPresent(session)
-  dismissResumeSummaryModalIfPresent(session)
   const oneLine = text.replace(/\r?\n/g, ' ')
   const CHUNK = 80
   // tmux send-keys doesn't support `--` option-terminator, so a chunk that

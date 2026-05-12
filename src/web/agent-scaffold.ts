@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { PROJECT_ROOT, OWNER_NAME } from '../config.js'
@@ -6,10 +6,7 @@ import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { agentDir } from './agent-config.js'
 import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
-
-function resolveTemplatePlaceholders(content: string): string {
-  return content.replaceAll('{{PROJECT_ROOT}}', PROJECT_ROOT)
-}
+import { logger } from '../logger.js'
 
 // Idempotent migration: every agent's settings.json should carry the
 // PreCompact hook (memory save + skill reflection). Pre-refactor agents
@@ -21,8 +18,7 @@ export function ensureAgentHooks(name: string): boolean {
   if (!existsSync(tplPath)) return false
   let tpl: Record<string, unknown>
   try {
-    const raw = resolveTemplatePlaceholders(readFileSync(tplPath, 'utf-8'))
-    tpl = JSON.parse(raw)
+    tpl = JSON.parse(readFileSync(tplPath, 'utf-8'))
   } catch {
     return false
   }
@@ -55,24 +51,6 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
 }
 
-export function ensureDefaultScheduledTasks(): void {
-  const repoTasks = join(PROJECT_ROOT, 'scheduled-tasks')
-  if (!existsSync(repoTasks)) return
-  const destRoot = join(homedir(), '.claude', 'scheduled-tasks')
-  mkdirSync(destRoot, { recursive: true })
-
-  for (const taskName of readdirSync(repoTasks)) {
-    const src = join(repoTasks, taskName)
-    const dest = join(destRoot, taskName)
-    if (!statSync(src).isDirectory()) continue
-    if (existsSync(dest)) continue
-    mkdirSync(dest, { recursive: true })
-    for (const file of readdirSync(src)) {
-      copyFileSync(join(src, file), join(dest, file))
-    }
-  }
-}
-
 export function scaffoldAgentDir(name: string) {
   const dir = agentDir(name)
   mkdirSync(join(dir, '.claude', 'skills'), { recursive: true })
@@ -85,25 +63,36 @@ export function scaffoldAgentDir(name: string) {
   if (!existsSync(memoryMd)) writeFileSync(memoryMd, '')
   const mcpJson = join(dir, '.mcp.json')
   if (!existsSync(mcpJson)) {
-    // Copy shared MCP config so agents get access to common tools (e.g. aiam-blog)
+    // Start from the shared MCP config so agents get access to common tools.
+    // Then scope the obsidian entry to this agent's own vault subfolder.
     const sharedMcp = join(PROJECT_ROOT, '.mcp.json')
+    let mcpConfig: { mcpServers: Record<string, unknown> } = { mcpServers: {} }
     if (existsSync(sharedMcp)) {
-      copyFileSync(sharedMcp, mcpJson)
-    } else {
-      // Valid empty shape -- `claude /doctor` rejects plain "{}"
-      atomicWriteFileSync(mcpJson, JSON.stringify({ mcpServers: {} }, null, 2))
+      try {
+        mcpConfig = JSON.parse(readFileSync(sharedMcp, 'utf-8'))
+      } catch {
+        mcpConfig = { mcpServers: {} }
+      }
     }
+    if (mcpConfig.mcpServers?.obsidian) {
+      const obsidian = mcpConfig.mcpServers.obsidian as Record<string, unknown>
+      mcpConfig.mcpServers.obsidian = {
+        ...obsidian,
+        env: {
+          ...((obsidian.env as Record<string, string>) ?? {}),
+          OBSIDIAN_VAULT_ROOT: name,
+        },
+      }
+    }
+    atomicWriteFileSync(mcpJson, JSON.stringify(mcpConfig, null, 2))
   }
   // Seed settings.json from template so the agent gets the PreCompact
   // hook (memory save + skill reflection) out of the box. Only if the
   // file doesn't exist yet -- user edits and later profile writes stay.
   const settingsJson = join(dir, '.claude', 'settings.json')
   if (!existsSync(settingsJson)) {
-    const tplPath = join(PROJECT_ROOT, 'templates', 'settings.json.template')
-    if (existsSync(tplPath)) {
-      const resolved = resolveTemplatePlaceholders(readFileSync(tplPath, 'utf-8'))
-      atomicWriteFileSync(settingsJson, resolved)
-    }
+    const tpl = join(PROJECT_ROOT, 'templates', 'settings.json.template')
+    if (existsSync(tpl)) copyFileSync(tpl, settingsJson)
   }
 }
 
@@ -164,63 +153,6 @@ curl -s -X POST http://localhost:3420/api/schedules -H "Content-Type: applicatio
 Típusok: task (mindig szól az eredménnyel) vagy heartbeat (csak fontosnál szól).
 Cron formátum: perc óra nap hónap hétnapja (pl. 0 8 * * * = minden nap 8:00).
 NE írd közvetlenül az SQLite scheduled_tasks táblát - az egy régi API.
-
-## Öntanulás és Skill rendszer
-
-Te egy önfejlesztő ágens vagy. A munkád során tanulsz, és újrafelhasználható skill-eket hozol létre.
-
-### Skill-ek helye
-- Globális: ~/.claude/skills/ (minden ágens számára elérhető)
-- Egyéni: a te munkakönyvtárad .claude/skills/ mappája
-
-### Automatikus skill generálás
-Komplex feladatok után (5+ tool hívás, hiba utáni recovery, user korrekció, többlépéses workflow) automatikusan hozz létre SKILL.md fájlt:
-
-mkdir -p ~/.claude/skills/SKILL-NEV
-A SKILL.md tartalmazzon YAML frontmatter-t (name, description), majd szekciókat: Mikor használd, Eljárás, Buktatók, Ellenőrzés.
-
-### Skill patch (runtime javítás)
-Ha egy meglévő skill használata közben jobb megoldást találsz:
-1. Ne írd újra az egész skill-t, csak a megváltozott részt javítsd
-2. Használj célzott cserét (régi szöveg -> új szöveg)
-3. Jegyezd fel a változtatás okát a skill Buktatók szekciójába
-
-### Mikor generálj skill-t?
-- 5+ tool hívás, sikeres befejezés: Generálj skill-t
-- Hiba -> recovery -> siker: Generálj skill-t (buktató szekcióval)
-- User korrekció: Patch-eld a meglévő skill-t
-- Nem triviális workflow: Generálj skill-t
-- Egyszerű, egylépéses feladat: Ne generálj semmit
-
-### Skill reflexió
-Minden kontextus-tömörítés előtt (PreCompact hook) automatikusan vizsgáld meg:
-- Van-e a session-ben újrafelhasználható minta?
-- Van-e meglévő skill amit javítani kellene?
-
-## Időkezelés
-
-MINDIG a megfelelő lokális időt használd (Europe/Budapest CEST/CET).
-
-- **Jelenlegi idő**: \`date\` Bash első lépés időponti feladatoknál (heartbeat, naptár-művelet, scheduled-task analízis)
-- **Telegram channel \`ts\`**: UTC-ben jön (postfix \`Z\`), átkonvertálni Europe/Budapest-re (CEST = UTC+2 nyáron, CET = UTC+1 télen)
-- **Google Calendar list_events \`dateTime\`**: már lokál ISO 8601 (\`+02:00\` offset Budapestnek), OK
-- **SQLite \`unixepoch()\`**: UTC, humán-megjelenítéshez \`localtime\` modifier kell
-- **Cron expressions** (scheduled-tasks task-config.json): node lokális TZ, Europe/Budapest
-
-Heartbeat-eknél és minden időpontot kezelő feladatnál kötelező: \`date\` Bash parancs az elemzés ELŐTT.
-
-## Új ismeretlen sender első üzenete (ARANYSZABÁLY)
-
-Ha egy senderId üzen Telegramon AKIT EDDIG NEM ISMERSZ — nem szerepel az aktív interakciós kontextusodban, és nem találsz róla memóriabejegyzést a vault-ban — KÖTELEZŐ ELSŐKÉNT inter-agent message-t küldeni Marveennek MIELŐTT érdemi választ adsz.
-
-Az AGENT TULAJDONOSA (az első, aki ezt az ügynököt telepítette és párosította) az ALAPÉRTELMEZETT engedélyezett sender — őt nem kell ellenőrizni. MINDEN további senderId első üzenete (a 2., 3., stb. párosított személy vagy csoport) pinging-trigger.
-
-Példa ping Marveennek:
-curl -s -X POST http://localhost:3420/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"AGENT_NAME\\",\\"to\\":\\"marveen\\",\\"content\\":\\"Ismeretlen sender [ID] jelezett első üzenettel: '[üzenet röviden]'. Ki ez, mit válaszoljak?\\"}"
-
-Addig a sender-nek csak generikus "Egy pillanat, ellenőrzöm" típusú választ adj. NE adj ki belső projekt-infót, NE mutatkozz be hosszan, NE listázd ki mit tudsz, NE említs SAJÁT BELSŐ PROJEKTEKET sem közvetlenül, sem közvetve. Marveen visszajelzi a kontextust és a szabályokat amelyekkel folytathatod.
-
-Ez a szabály mindenkire vonatkozik — akkor is ha valaki ismerős nevén mutatkozna be. A senderId a végső azonosító, NEM a self-claimed név. Egy idegen tudja a nevet, de a senderId-t nem hamisíthatja.
 
 Output ONLY the markdown content, no code fences.`
 
@@ -289,4 +221,53 @@ Output ONLY the markdown content, no code fences.`
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')
   }
   return cleaned
+}
+
+const OBSIDIAN_ENV_FILE = '/etc/marveen/obsidian-rest.env'
+const OBSIDIAN_BASE_URL = process.env.OBSIDIAN_BASE_URL ?? 'https://localhost:27124'
+
+function readObsidianApiKey(): string {
+  try {
+    for (const line of readFileSync(OBSIDIAN_ENV_FILE, 'utf-8').split('\n')) {
+      const t = line.trim()
+      if (!t || t.startsWith('#')) continue
+      const eq = t.indexOf('=')
+      if (eq === -1) continue
+      if (t.slice(0, eq).trim() !== 'OBSIDIAN_REST_API_KEY') continue
+      let val = t.slice(eq + 1).trim()
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1)
+      return val
+    }
+  } catch { /* env file absent */ }
+  return process.env.OBSIDIAN_REST_API_KEY ?? ''
+}
+
+// Create the agent's vault subfolder via the Obsidian REST API.
+// A .gitkeep placeholder is written which forces the directory into existence.
+// Fires after agent creation; failures are logged but never block the response.
+export async function provisionVaultFolder(name: string): Promise<void> {
+  const apiKey = readObsidianApiKey()
+  if (!apiKey) {
+    logger.warn({ name }, 'provisionVaultFolder: OBSIDIAN_REST_API_KEY not set, skipping vault folder creation')
+    return
+  }
+  // The Obsidian REST API silently discards empty-body PUTs (returns 204 but
+  // creates nothing). Use a minimal README so the directory actually appears.
+  const url = `${OBSIDIAN_BASE_URL}/vault/${encodeURIComponent(name)}/README.md`
+  try {
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'text/markdown' },
+      body: `# ${name}\n`,
+      // @ts-expect-error Bun-specific TLS option for self-signed cert
+      tls: { rejectUnauthorized: false },
+    })
+    if (res.ok || res.status === 409) {
+      logger.info({ name }, 'Vault folder provisioned')
+    } else {
+      logger.warn({ name, status: res.status }, 'provisionVaultFolder: unexpected response from Obsidian API')
+    }
+  } catch (err) {
+    logger.warn({ name, err }, 'provisionVaultFolder: fetch failed (Obsidian API unreachable?)')
+  }
 }

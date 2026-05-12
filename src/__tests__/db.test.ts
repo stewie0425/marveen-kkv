@@ -21,6 +21,10 @@ import {
   deletePendingTaskRetryById,
   markPendingTaskRetryAlert,
   clearPendingTaskRetryAlert,
+  createAgentMessage,
+  markMessageDelivered,
+  getStuckDeliveredMessages,
+  markAgentMessageStuckAlerted,
 } from '../db.js'
 import { STORE_DIR } from '../config.js'
 
@@ -235,6 +239,59 @@ describe('pending task retries', () => {
 
     // After clear, markAlert succeeds again
     expect(markPendingTaskRetryAlert('task-clear-alert', 'main', 11_000_200)).toBe(true)
+  })
+})
+
+describe('createAgentMessage closureAck', () => {
+  it('stamps result so the watchdog skips closure-ack rows', () => {
+    const msg = createAgentMessage('cack-from', 'cack-to', 'kösz, lezárva', { closureAck: true })
+    expect(msg.result).toBe('closure-ack: no reply expected')
+    markMessageDelivered(msg.id)
+    const past = Math.floor(Date.now() / 1000) - 24 * 60 * 60
+    getDb().prepare('UPDATE agent_messages SET delivered_at = ? WHERE id = ?').run(past, msg.id)
+
+    const ids = getStuckDeliveredMessages(Math.floor(Date.now() / 1000) - 60).map(m => m.id)
+    expect(ids).not.toContain(msg.id)
+  })
+
+  it('regular messages still surface as stuck', () => {
+    const msg = createAgentMessage('cack-from-2', 'cack-to-2', 'eredmény jön?')
+    expect(msg.result).toBeNull()
+    markMessageDelivered(msg.id)
+    const past = Math.floor(Date.now() / 1000) - 24 * 60 * 60
+    getDb().prepare('UPDATE agent_messages SET delivered_at = ? WHERE id = ?').run(past, msg.id)
+
+    const ids = getStuckDeliveredMessages(Math.floor(Date.now() / 1000) - 60).map(m => m.id)
+    expect(ids).toContain(msg.id)
+  })
+})
+
+describe('getStuckDeliveredMessages', () => {
+  it('skips rows already stamped with a stuck-alert audit string', () => {
+    const oldMsg = createAgentMessage('stuck-test-from', 'stuck-test-to-a', 'old delivered')
+    markMessageDelivered(oldMsg.id)
+    const past = Math.floor(Date.now() / 1000) - 24 * 60 * 60
+    getDb().prepare('UPDATE agent_messages SET delivered_at = ? WHERE id = ?').run(past, oldMsg.id)
+
+    const cutoff = Math.floor(Date.now() / 1000) - 60
+    const before = getStuckDeliveredMessages(cutoff).map(m => m.id)
+    expect(before).toContain(oldMsg.id)
+
+    expect(markAgentMessageStuckAlerted(oldMsg.id, Math.floor(Date.now() / 1000))).toBe(true)
+
+    const after = getStuckDeliveredMessages(cutoff).map(m => m.id)
+    expect(after).not.toContain(oldMsg.id)
+  })
+
+  it('still returns un-alerted rows past the cutoff', () => {
+    const msg = createAgentMessage('stuck-test-from', 'stuck-test-to-b', 'fresh-but-stale')
+    markMessageDelivered(msg.id)
+    const past = Math.floor(Date.now() / 1000) - 24 * 60 * 60
+    getDb().prepare('UPDATE agent_messages SET delivered_at = ? WHERE id = ?').run(past, msg.id)
+
+    const cutoff = Math.floor(Date.now() / 1000) - 60
+    const ids = getStuckDeliveredMessages(cutoff).map(m => m.id)
+    expect(ids).toContain(msg.id)
   })
 })
 

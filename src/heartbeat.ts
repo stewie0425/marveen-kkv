@@ -3,12 +3,10 @@ import { join } from 'node:path'
 import {
   HEARTBEAT_START_HOUR,
   HEARTBEAT_END_HOUR,
-  HEARTBEAT_CALENDAR_ID,
   STORE_DIR,
   OWNER_NAME,
 } from './config.js'
 import { getHeartbeatKanbanSummary, getActiveScheduledTaskCount } from './db.js'
-import { getCalendarEvents, type CalendarEvent } from './google-api.js'
 import { runAgent } from './agent.js'
 import { notifyTelegram } from './notify.js'
 import { logger } from './logger.js'
@@ -23,24 +21,12 @@ interface SystemInfo {
 
 interface HeartbeatData {
   timestamp: Date
-  calendar: CalendarEvent[]
   kanban: { urgent: number; in_progress: number; waiting: number; urgentTitles: string[]; waitingTitles: string[] }
   system: SystemInfo
   tasks: { count: number; nextRun: number | null }
 }
 
 // --- Data collection ---
-
-async function collectCalendar(): Promise<CalendarEvent[]> {
-  try {
-    const now = new Date()
-    const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000)
-    return await getCalendarEvents(HEARTBEAT_CALENDAR_ID, now, twoHoursLater)
-  } catch (err) {
-    logger.error({ err }, 'Heartbeat: calendar fetch failed')
-    return []
-  }
-}
 
 function collectKanban(): HeartbeatData['kanban'] {
   try {
@@ -69,13 +55,10 @@ function collectSystem(): SystemInfo {
 }
 
 async function collectData(): Promise<HeartbeatData> {
-  const [calendar, kanban, system] = await Promise.all([
-    collectCalendar(),
-    Promise.resolve(collectKanban()),
-    Promise.resolve(collectSystem()),
-  ])
+  const kanban = collectKanban()
+  const system = collectSystem()
   const tasks = getActiveScheduledTaskCount()
-  return { timestamp: new Date(), calendar, kanban, system, tasks }
+  return { timestamp: new Date(), kanban, system, tasks }
 }
 
 // --- Notification filter ---
@@ -87,11 +70,6 @@ function shouldNotify(data: HeartbeatData): boolean {
 
   if (data.system.dbWarning) return true
 
-  // 22:00 utan csendes ablak -- csak igazi rendszer-vesz (dbWarning, fent
-  // mar return-olt) lephet at. Stale urgent kanban-kartyak este nem zavarjak
-  // a felhasznalot.
-  if (hour >= 22) return false
-
   if (hour >= 21) {
     return data.kanban.urgent > 0
   }
@@ -100,7 +78,6 @@ function shouldNotify(data: HeartbeatData): boolean {
     return data.kanban.urgent > 0
   }
 
-  if (data.calendar.length > 0) return true
   if (data.kanban.urgent > 0) return true
   if (data.kanban.waiting > 2) return true
 
@@ -119,24 +96,6 @@ function buildAgentPrompt(data: HeartbeatData): string {
   prompt += `Az alabbi adatokat gyujtottem nativ modon (API/DB). Fogalmazz tomor, emberi osszefoglalot ${OWNER_NAME}-nak.\n`
   prompt += `FONTOS: Nezd meg az emaileket is MCP-n keresztul (search_emails, utolso 2 ora, olvasatlanok).\n`
   prompt += `Hasznald a HEARTBEAT.md formatumot.\n\n`
-
-  // Calendar -- event summaries and attendee names come from whoever sent the
-  // invite, so every one is wrapped individually as untrusted data.
-  prompt += `## Naptar (kovetkezo 2 ora)\n`
-  if (data.calendar.length === 0) {
-    prompt += `Nincs kozelgo esemeny.\n\n`
-  } else {
-    for (const ev of data.calendar) {
-      const start = ev.start?.dateTime
-        ? new Date(ev.start.dateTime).toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Budapest' })
-        : 'egesz napos'
-      const attendeesRaw = ev.attendees?.map((a) => a.displayName || a.email).join(', ') || '-'
-      const summaryWrapped = wrapUntrusted('gcal-event-summary', ev.summary ?? '(cim nelkul)')
-      const attendeesWrapped = wrapUntrusted('gcal-event-attendees', attendeesRaw)
-      prompt += `- @ ${start}\n  summary: ${summaryWrapped}\n  attendees: ${attendeesWrapped}\n`
-    }
-    prompt += '\n'
-  }
 
   // Kanban -- card titles are operator-authored today, but a future Kanban-sync
   // integration could bring them from third parties. Wrap defensively.
