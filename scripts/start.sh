@@ -22,6 +22,8 @@ elif [ "$OS" = "Linux" ]; then
     : # systemctl --user worked
   else
     # systemctl --user unavailable (LXC/root without D-Bus); start directly.
+    # Augment PATH so node can find claude (installed under ~/.local/bin etc.)
+    export PATH="$HOME/.local/bin:$HOME/.npm/bin:/usr/local/bin:$PATH"
     NODE_BIN="$(command -v node || echo node)"
     nohup "$NODE_BIN" "$INSTALL_DIR/dist/index.js" \
       >"$INSTALL_DIR/store/dashboard.log" 2>&1 &
