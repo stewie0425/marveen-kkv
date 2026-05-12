@@ -8,6 +8,10 @@ import { agentDir } from './agent-config.js'
 import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
 import { logger } from '../logger.js'
 
+function resolveTemplatePlaceholders(content: string): string {
+  return content.replaceAll('{{PROJECT_ROOT}}', PROJECT_ROOT)
+}
+
 // Idempotent migration: every agent's settings.json should carry the
 // PreCompact hook (memory save + skill reflection). Pre-refactor agents
 // were scaffolded before scaffoldAgentDir seeded the template, so their
@@ -18,7 +22,8 @@ export function ensureAgentHooks(name: string): boolean {
   if (!existsSync(tplPath)) return false
   let tpl: Record<string, unknown>
   try {
-    tpl = JSON.parse(readFileSync(tplPath, 'utf-8'))
+    const raw = resolveTemplatePlaceholders(readFileSync(tplPath, 'utf-8'))
+    tpl = JSON.parse(raw)
   } catch {
     return false
   }
@@ -91,8 +96,11 @@ export function scaffoldAgentDir(name: string) {
   // file doesn't exist yet -- user edits and later profile writes stay.
   const settingsJson = join(dir, '.claude', 'settings.json')
   if (!existsSync(settingsJson)) {
-    const tpl = join(PROJECT_ROOT, 'templates', 'settings.json.template')
-    if (existsSync(tpl)) copyFileSync(tpl, settingsJson)
+    const tplPath = join(PROJECT_ROOT, 'templates', 'settings.json.template')
+    if (existsSync(tplPath)) {
+      const resolved = resolveTemplatePlaceholders(readFileSync(tplPath, 'utf-8'))
+      atomicWriteFileSync(settingsJson, resolved)
+    }
   }
 }
 
@@ -153,6 +161,50 @@ curl -s -X POST http://localhost:3420/api/schedules -H "Content-Type: applicatio
 Típusok: task (mindig szól az eredménnyel) vagy heartbeat (csak fontosnál szól).
 Cron formátum: perc óra nap hónap hétnapja (pl. 0 8 * * * = minden nap 8:00).
 NE írd közvetlenül az SQLite scheduled_tasks táblát - az egy régi API.
+
+## Öntanulás és Skill rendszer
+
+Te egy önfejlesztő ágens vagy. A munkád során tanulsz, és újrafelhasználható skill-eket hozol létre.
+
+### Skill-ek helye
+- Globális: ~/.claude/skills/ (minden ágens számára elérhető)
+- Egyéni: a te munkakönyvtárad .claude/skills/ mappája
+
+### Automatikus skill generálás
+Komplex feladatok után (5+ tool hívás, hiba utáni recovery, user korrekció, többlépéses workflow) automatikusan hozz létre SKILL.md fájlt:
+
+mkdir -p ~/.claude/skills/SKILL-NEV
+A SKILL.md tartalmazzon YAML frontmatter-t (name, description), majd szekciókat: Mikor használd, Eljárás, Buktatók, Ellenőrzés.
+
+### Skill patch (runtime javítás)
+Ha egy meglévő skill használata közben jobb megoldást találsz:
+1. Ne írd újra az egész skill-t, csak a megváltozott részt javítsd
+2. Használj célzott cserét (régi szöveg -> új szöveg)
+3. Jegyezd fel a változtatás okát a skill Buktatók szekciójába
+
+### Mikor generálj skill-t?
+- 5+ tool hívás, sikeres befejezés: Generálj skill-t
+- Hiba -> recovery -> siker: Generálj skill-t (buktató szekcióval)
+- User korrekció: Patch-eld a meglévő skill-t
+- Nem triviális workflow: Generálj skill-t
+- Egyszerű, egylépéses feladat: Ne generálj semmit
+
+### Skill reflexió
+Minden kontextus-tömörítés előtt (PreCompact hook) automatikusan vizsgáld meg:
+- Van-e a session-ben újrafelhasználható minta?
+- Van-e meglévő skill amit javítani kellene?
+
+## Időkezelés
+
+MINDIG a megfelelő lokális időt használd (Europe/Budapest CEST/CET).
+
+- **Jelenlegi idő**: \`date\` Bash első lépés időponti feladatoknál (heartbeat, naptár-művelet, scheduled-task analízis)
+- **Telegram channel \`ts\`**: UTC-ben jön (postfix \`Z\`), átkonvertálni Europe/Budapest-re (CEST = UTC+2 nyáron, CET = UTC+1 télen)
+- **Google Calendar list_events \`dateTime\`**: már lokál ISO 8601 (\`+02:00\` offset Budapestnek), OK
+- **SQLite \`unixepoch()\`**: UTC, humán-megjelenítéshez \`localtime\` modifier kell
+- **Cron expressions** (scheduled-tasks task-config.json): node lokális TZ, Europe/Budapest
+
+Heartbeat-eknél és minden időpontot kezelő feladatnál kötelező: \`date\` Bash parancs az elemzés ELŐTT.
 
 Output ONLY the markdown content, no code fences.`
 
