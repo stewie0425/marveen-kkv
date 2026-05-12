@@ -315,6 +315,14 @@ export interface UpdateStatus {
   error?: string
 }
 
+export interface UpstreamStatus {
+  behind?: number
+  remote?: string
+  last_synced?: string
+  commits?: UpdateCommit[]
+  error?: string
+}
+
 // --- Skills (GET /api/skills) ---
 
 export interface Skill {
