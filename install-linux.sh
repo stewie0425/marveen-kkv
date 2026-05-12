@@ -878,11 +878,14 @@ DASH_TOKEN=""
 if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
   DASH_TOKEN=$(cat "$INSTALL_DIR/store/.dashboard-token")
 fi
+LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[ -z "$LOCAL_IP" ] && LOCAL_IP=$(ip route get 1 2>/dev/null | awk '{print $(NF-2)}')
+[ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
 if [ -n "$DASH_TOKEN" ]; then
-  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:3420/?token=${DASH_TOKEN}${NC}"
+  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://${LOCAL_IP}:3420/?token=${DASH_TOKEN}${NC}"
   echo -e "  ${DIM}(Nyisd meg egyszer, utana a bongeszo megjegyzi a tokent)${NC}"
 else
-  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:3420"
+  echo -e "  ${BOLD}Dashboard:${NC} http://${LOCAL_IP}:3420"
   echo -e "  ${DIM}(A tokenes URL-t a szerver logban talalod)${NC}"
 fi
 echo -e "  ${BOLD}Telegram:${NC} Irj a botodnak!"
