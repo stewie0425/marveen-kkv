@@ -325,6 +325,41 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_retries_first_attempt ON pending_task_retries(first_attempt)`)
 
+  // --- Dashboard Users ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dashboard_users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
+    )
+  `)
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dashboard_user_sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON dashboard_user_sessions(user_id)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON dashboard_user_sessions(expires_at)`)
+
+  // --- User Chat Messages ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_chat_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_uchat_user_id ON user_chat_messages(user_id, created_at)`)
+
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
   // re-importing. Wrapped in a transaction so a crash mid-import is safe.
@@ -799,15 +834,46 @@ export interface AgentMessage {
   completed_at: number | null
 }
 
-export function createAgentMessage(from: string, to: string, content: string): AgentMessage {
+export interface CreateAgentMessageOptions {
+  // closure_ack flags a fire-and-forget thank-you / standby / FYI message that
+  // does NOT expect a reply. The row is still delivered to the recipient's
+  // pane normally (status flow pending -> delivered), but the result column
+  // is pre-stamped 'closure-ack: ...' at insert time and the stuck-coordination
+  // watchdog excludes such rows from its idle-alert query. Without this flag
+  // closure-acks accumulate as delivered+open forever and the watchdog fires
+  // false positives 5min after every "köszi, lezárva".
+  closureAck?: boolean
+}
+
+export function createAgentMessage(
+  from: string,
+  to: string,
+  content: string,
+  opts: CreateAgentMessageOptions = {},
+): AgentMessage {
   const now = Math.floor(Date.now() / 1000)
-  const info = db.prepare(
-    'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at) VALUES (?, ?, ?, ?, ?)'
-  ).run(from, to, content, 'pending', now)
+  const initialResult = opts.closureAck ? 'closure-ack: no reply expected' : null
+  const tx = db.transaction(() => {
+    const info = db.prepare(
+      'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, result) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(from, to, content, 'pending', now, initialResult)
+    db.prepare(`
+      UPDATE agent_messages
+      SET status = 'done',
+          completed_at = @completed_at,
+          result = COALESCE(result, 'auto-closed by reply from ' || @reply_from)
+      WHERE status = 'delivered'
+        AND from_agent = @prior_from
+        AND to_agent = @prior_to
+        AND completed_at IS NULL
+    `).run({ completed_at: now, reply_from: from, prior_from: to, prior_to: from })
+    return info
+  })
+  const info = tx()
   return {
     id: Number(info.lastInsertRowid),
     from_agent: from, to_agent: to, content, status: 'pending',
-    result: null, created_at: now, delivered_at: null, completed_at: null,
+    result: initialResult, created_at: now, delivered_at: null, completed_at: null,
   }
 }
 
@@ -1069,4 +1135,152 @@ export async function backfillEmbeddings(): Promise<number> {
     await new Promise(r => setTimeout(r, 100))
   }
   return count
+}
+
+// --- Dashboard Users ---
+
+export interface DashboardUser {
+  id: number
+  email: string
+  password_hash: string
+  role: 'admin' | 'user'
+  active: number
+  created_at: number
+}
+
+export interface DashboardUserPublic {
+  id: number
+  email: string
+  role: 'admin' | 'user'
+  active: boolean
+  created_at: number
+}
+
+export function hasAnyDashboardAdmin(): boolean {
+  const row = db.prepare("SELECT COUNT(*) as c FROM dashboard_users WHERE role = 'admin' AND active = 1").get() as { c: number }
+  return row.c > 0
+}
+
+export function createDashboardUser(email: string, passwordHash: string, role: 'admin' | 'user'): DashboardUser {
+  const now = Math.floor(Date.now() / 1000)
+  const result = db.prepare(
+    'INSERT INTO dashboard_users (email, password_hash, role, active, created_at) VALUES (?, ?, ?, 1, ?)'
+  ).run(email.toLowerCase().trim(), passwordHash, role, now)
+  return db.prepare('SELECT * FROM dashboard_users WHERE id = ?').get(result.lastInsertRowid) as DashboardUser
+}
+
+export function getDashboardUserByEmail(email: string): DashboardUser | undefined {
+  return db.prepare('SELECT * FROM dashboard_users WHERE email = ? AND active = 1').get(email.toLowerCase().trim()) as DashboardUser | undefined
+}
+
+export function getDashboardUserById(id: number): DashboardUser | undefined {
+  return db.prepare('SELECT * FROM dashboard_users WHERE id = ?').get(id) as DashboardUser | undefined
+}
+
+export function listDashboardUsers(): DashboardUserPublic[] {
+  const rows = db.prepare('SELECT id, email, role, active, created_at FROM dashboard_users ORDER BY created_at ASC').all() as Array<{ id: number; email: string; role: string; active: number; created_at: number }>
+  return rows.map(r => ({ ...r, role: r.role as 'admin' | 'user', active: r.active === 1 }))
+}
+
+export function updateDashboardUser(id: number, fields: { role?: 'admin' | 'user'; active?: boolean; passwordHash?: string }): boolean {
+  const sets: string[] = []
+  const vals: unknown[] = []
+  if (fields.role !== undefined) { sets.push('role = ?'); vals.push(fields.role) }
+  if (fields.active !== undefined) { sets.push('active = ?'); vals.push(fields.active ? 1 : 0) }
+  if (fields.passwordHash !== undefined) { sets.push('password_hash = ?'); vals.push(fields.passwordHash) }
+  if (sets.length === 0) return false
+  vals.push(id)
+  return db.prepare(`UPDATE dashboard_users SET ${sets.join(', ')} WHERE id = ?`).run(...vals as []).changes > 0
+}
+
+export function deleteDashboardUser(id: number): boolean {
+  return db.prepare('DELETE FROM dashboard_users WHERE id = ?').run(id).changes > 0
+}
+
+export function createUserSession(userId: number, token: string, ttlSeconds = 30 * 24 * 3600): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(
+    'INSERT INTO dashboard_user_sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+  ).run(token, userId, now + ttlSeconds, now)
+}
+
+export function getUserBySession(token: string): DashboardUser | undefined {
+  const now = Math.floor(Date.now() / 1000)
+  const row = db.prepare(
+    'SELECT u.* FROM dashboard_users u JOIN dashboard_user_sessions s ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > ? AND u.active = 1'
+  ).get(token, now) as DashboardUser | undefined
+  return row
+}
+
+export function deleteUserSession(token: string): void {
+  db.prepare('DELETE FROM dashboard_user_sessions WHERE token = ?').run(token)
+}
+
+export function purgeExpiredUserSessions(): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare('DELETE FROM dashboard_user_sessions WHERE expires_at <= ?').run(now)
+}
+
+// --- User Chat Messages ---
+
+export interface UserChatMessage {
+  id: number
+  user_id: number
+  role: 'user' | 'assistant'
+  content: string
+  created_at: number
+}
+
+export function insertUserChatMessage(userId: number, role: 'user' | 'assistant', content: string): UserChatMessage {
+  const now = Math.floor(Date.now() / 1000)
+  const result = db.prepare(
+    'INSERT INTO user_chat_messages (user_id, role, content, created_at) VALUES (?, ?, ?, ?)'
+  ).run(userId, role, content, now)
+  return db.prepare('SELECT * FROM user_chat_messages WHERE id = ?').get(result.lastInsertRowid) as UserChatMessage
+}
+
+export function getUserChatHistory(userId: number, limit = 50): UserChatMessage[] {
+  return db.prepare(
+    'SELECT * FROM user_chat_messages WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'
+  ).all(userId, limit) as UserChatMessage[]
+}
+
+export function getLatestAssistantMessage(userId: number, afterId: number): UserChatMessage | undefined {
+  return db.prepare(
+    "SELECT * FROM user_chat_messages WHERE user_id = ? AND id > ? AND role = 'assistant' ORDER BY id ASC LIMIT 1"
+  ).get(userId, afterId) as UserChatMessage | undefined
+}
+
+// --- Coordination Watchdog Queries ---
+
+export function getStuckDeliveredMessages(maxDeliveredAtSec: number, limit = 50): AgentMessage[] {
+  return db.prepare(`
+    SELECT m.* FROM agent_messages m
+    WHERE m.status = 'delivered'
+      AND m.completed_at IS NULL
+      AND m.delivered_at IS NOT NULL
+      AND m.delivered_at < ?
+      AND (m.result IS NULL OR (
+        m.result NOT LIKE 'stuck-alert sent at%'
+        AND m.result NOT LIKE 'closure-ack%'
+      ))
+      AND NOT EXISTS (
+        SELECT 1 FROM agent_messages r
+        WHERE r.from_agent = m.to_agent
+          AND r.to_agent = m.from_agent
+          AND r.created_at > m.delivered_at
+      )
+    ORDER BY m.delivered_at ASC
+    LIMIT ?
+  `).all(maxDeliveredAtSec, limit) as AgentMessage[]
+}
+
+export function markAgentMessageStuckAlerted(id: number, atSec: number): boolean {
+  return db.prepare(`
+    UPDATE agent_messages
+    SET result = 'stuck-alert sent at ' || ?
+    WHERE id = ?
+      AND status = 'delivered'
+      AND completed_at IS NULL
+  `).run(String(atSec), id).changes > 0
 }

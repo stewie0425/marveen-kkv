@@ -31,3 +31,6 @@ export const HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000 // 1 hour
 export const HEARTBEAT_START_HOUR = 9
 export const HEARTBEAT_END_HOUR = 23
 export const HEARTBEAT_CALENDAR_ID = env['HEARTBEAT_CALENDAR_ID'] ?? ''
+
+export const RAG_URL = env['MARVEEN_RAG_URL'] ?? 'http://localhost:8088'
+export const RAG_TOKEN = env['MARVEEN_RAG_TOKEN'] ?? ''
