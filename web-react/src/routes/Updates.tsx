@@ -289,7 +289,10 @@ export default function UpdatesPage() {
 
           {/* Upstream summary banner */}
           {upstreamBehind > 0 && !applyStarted && (
-            <div className="flex items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-2.5 text-sm">
+            <div
+              className="flex items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-2.5 text-sm"
+              title="Sandor naponta review-zza és integrálja az approved fejlesztéseket."
+            >
               <span className="text-[var(--color-text-muted)]">
                 <strong className="text-[var(--color-text)]">{upstreamBehind} upstream commit</strong>
                 {upstreamData?.remote && (
@@ -304,14 +307,11 @@ export default function UpdatesPage() {
                 disabled={syncMut.isPending}
                 leftIcon={
                   <svg width="14" height="14" viewBox="0 0 24 24" {...stroke}>
-                    <polyline points="17 1 21 5 17 9" />
-                    <path d="M3 11V9a4 4 0 0 1 4-4h14" />
-                    <polyline points="7 23 3 19 7 15" />
-                    <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.99 12a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.9 1.27h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9a16 16 0 0 0 6.91 6.91l1.08-1.08a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />
                   </svg>
                 }
               >
-                {syncMut.isPending ? 'Küldés…' : 'Upstream sync kérése'}
+                {syncMut.isPending ? 'Küldés…' : 'Sandor értesítése'}
               </Button>
             </div>
           )}
@@ -352,19 +352,6 @@ export default function UpdatesPage() {
                       <span className="flex-1 text-[var(--color-text)]">
                         {c.message.split('\n')[0]}
                       </span>
-                      {c.source === 'Upstream' && (() => {
-                        const cat = getIntegrationCategory(c.components)
-                        const label = cat === 'safe' ? 'Integráció kérése' : 'Review + integráció kérése'
-                        return (
-                          <button
-                            onClick={() => onSyncRequest([c.sha])}
-                            disabled={syncMut.isPending}
-                            className="shrink-0 rounded border border-[var(--color-border)] px-2 py-0.5 text-[10px] font-medium text-[var(--color-text-muted)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] disabled:opacity-50"
-                          >
-                            {syncMut.isPending ? 'Küldés…' : label}
-                          </button>
-                        )
-                      })()}
                     </div>
                     {c.components && c.components.length > 0 && (
                       <div className="flex flex-wrap gap-1">
