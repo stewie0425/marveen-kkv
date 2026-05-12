@@ -10,7 +10,7 @@ web-react/tsconfig.tsbuildinfo
 .env
 store/
 workspace/
-agents/
+/agents/
 reports/
 .claude/
 .config/
