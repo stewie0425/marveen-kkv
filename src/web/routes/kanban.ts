@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import {
   listKanbanCards, createKanbanCard, updateKanbanCard,
   deleteKanbanCard, moveKanbanCard, archiveKanbanCard,
-  getKanbanComments, addKanbanComment,
+  getKanbanComments, addKanbanComment, listKanbanProjects,
   getKanbanCard, createAgentMessage,
 } from '../../db.js'
 import { OWNER_NAME, BOT_NAME, MAIN_AGENT_ID } from '../../config.js'
@@ -25,6 +25,11 @@ function resolveForwardTarget(author: string): string | null {
 
 export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
+
+  if (path === '/api/kanban-projects' && method === 'GET') {
+    json(res, listKanbanProjects())
+    return true
+  }
 
   if (path === '/api/kanban' && method === 'GET') {
     json(res, listKanbanCards())

@@ -81,7 +81,7 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
   try {
     let prefix: string
     if (task.type === 'heartbeat') {
-      prefix = `[Heartbeat: ${task.name}] FONTOS: Ez egy csendes ellenorzes. CSAK AKKOR irj Telegramon (chat_id: ${ALLOWED_CHAT_ID}), ha tenyleg fontos/surgos dolgot talalsz. Ha minden rendben, NE irj semmit -- maradj csendben. `
+      prefix = `[Heartbeat: ${task.name}] *** KOTELEZO ELSO TEENDO MIELOTT BARMIT IRSZ: hivj meg pontosan EGY local-only tool-t (peldaul Bash 'echo keepalive >> /tmp/marveen-keepalive.log' VAGY Read tool egy meglevo fajlra mint /tmp/keepalive.log). NE Telegram-tool-t -- az zajt eredmenyezne. Ezt a Telegram-bun MCP-stdio-pipe keep-alive-ehez kell, ha kihagyod, a Telegram-conn 30 percen belul disconnect-el. *** Aztan: ez egy csendes ellenorzes. CSAK AKKOR irj Telegramon (chat_id: ${ALLOWED_CHAT_ID}), ha tenyleg fontos/surgos dolgot talalsz. Ha minden rendben, NE kuldj Telegram uzenetet -- a kotelezo no-op tool-call mar megfelelo aktivitas. Egy rovid 'csendes heartbeat' sor a transzkriptbe + a tool-call elég. `
     } else {
       prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${ALLOWED_CHAT_ID}, reply tool). `
     }
@@ -254,6 +254,17 @@ export function startScheduleRunner(): NodeJS.Timeout {
         if (pendingKeys.has(key)) continue
         const result = attemptFireTask(task, agentName, now)
         if (result === 'busy') {
+          if (task.skipIfBusy) {
+            // Opt-in skip for short-cadence tasks (e.g. 30-min heartbeats):
+            // a single missed tick is harmless because the next one is
+            // already on the way, and queueing them produces spurious
+            // "60 perce varakozik" Telegram alerts whenever the operator
+            // is having an active conversation in the channels session.
+            // Daily/weekly schedules keep skipIfBusy=false so the queue
+            // + alert path catches a long-running busy state.
+            logger.info({ task: task.name, agent: agentName }, 'Schedule busy, skipIfBusy=true: dropping tick silently')
+            continue
+          }
           // First encounter -- insert a new pending row. If somehow a
           // row already exists (race with a just-cancelled retry), do
           // nothing so the cancel wins the tiebreak.
