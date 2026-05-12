@@ -71,7 +71,7 @@ if ! command -v apt-get &>/dev/null; then
 fi
 
 MISSING_PKGS=""
-for pkg in ffmpeg git tmux lsof curl python3 pipx unzip zstd; do
+for pkg in ffmpeg git tmux lsof curl python3 pipx unzip; do
   if ! command -v "$pkg" &>/dev/null; then
     MISSING_PKGS="$MISSING_PKGS $pkg"
   fi
@@ -113,7 +113,13 @@ ok "pipx" $(pipx --version)
 ok "python3 $(python3 --version | awk '{print $2}')"
 ok "tmux $(tmux -V | awk '{print $2}')"
 ok "unzip" $(unzip -v | awk 'NR==1 {print $2}')
-ok "zstd $(zstd --version | awk '{print $1}')"
+
+# zstd: unconditional frissites -- command -v alapu check nem eleg,
+# mert regi dependency-bol telepult verzio nem tamogatja az Ollama extractiot
+echo -e "  zstd frissitese..."
+sudo apt-get update -qq 2>/dev/null
+sudo apt-get install -y zstd -qq 2>/dev/null
+ok "zstd $(zstd --version 2>/dev/null | head -1)"
 
 # ─────────────────────────────────────────────
 # [2/7] Claude Code + Bun telepitese
