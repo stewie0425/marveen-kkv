@@ -45,8 +45,8 @@ import { tryHandleUserChat } from './web/routes/user-chat.js'
 import { hasAnyDashboardAdmin } from './db.js'
 import type { RouteContext } from './web/routes/types.js'
 
-// KKV product uses the vanilla-JS frontend in web/.
-const WEB_DIR = join(PROJECT_ROOT, 'web')
+// React build is the canonical UI. web/ stays as a fallback for legacy paths.
+const WEB_DIR = join(PROJECT_ROOT, 'web-react', 'dist')
 const LEGACY_WEB_DIR = join(PROJECT_ROOT, 'web')
 
 function ensureDirs() {

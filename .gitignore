@@ -2,9 +2,9 @@
 node_modules/
 dist/
 
-# Marveen dashboard React rewrite -- in-progress migration. Stays out of
-# main until parity with the legacy web/ is reached and the cutover lands.
-web-react/
+# web-react: React dashboard (node_modules excluded, dist/ is committed)
+web-react/node_modules/
+web-react/tsconfig.tsbuildinfo
 
 # Secrets & personal data
 .env

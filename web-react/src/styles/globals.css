@@ -1,0 +1,97 @@
+@import 'tailwindcss';
+
+/* The dark variant is driven by data-theme="dark" on <html>, set by the
+ * theme bootstrap in index.html and by useTheme(). Tailwind v4 with
+ * @custom-variant lets `dark:` classes resolve to that selector. */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+/* Anthropic palette mirrored from the legacy web/style.css. The legacy
+ * dashboard kept accent + semantic colors constant across themes; we do
+ * the same so the visual hangulat is identical. */
+@theme {
+  --color-bg: #faf9f5;
+  --color-surface: #ffffff;
+  --color-surface-hover: #f5f4ed;
+  --color-input: #f0eee6;
+  --color-modal: #ffffff;
+  --color-code: #f0eee6;
+  --color-text: #141413;
+  --color-text-secondary: #30302e;
+  --color-text-muted: #87867f;
+  --color-border: #d1cfc5;
+  --color-border-focus: #d97757;
+  --color-accent: #d97757;
+  --color-accent-hover: #c46849;
+  --color-accent-soft: rgba(217, 119, 87, 0.12);
+  --color-danger: #bf4d43;
+  --color-danger-soft: rgba(191, 77, 67, 0.12);
+  --color-success: #788c5d;
+  --color-success-soft: rgba(120, 140, 93, 0.12);
+  --color-info: #6a9bcc;
+  --color-info-soft: rgba(106, 155, 204, 0.12);
+  --shadow-sm: 0 1px 3px rgba(20, 20, 19, 0.04);
+  --shadow-md: 0 4px 16px rgba(20, 20, 19, 0.06);
+  --shadow-lg: 0 8px 32px rgba(20, 20, 19, 0.1);
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+}
+
+/* Dark theme overrides -- only the tokens that should flip. */
+[data-theme='dark'] {
+  --color-bg: #141413;
+  --color-surface: #1f1e1d;
+  --color-surface-hover: #262624;
+  --color-input: #30302e;
+  --color-modal: #1f1e1d;
+  --color-code: #262624;
+  --color-text: #faf9f5;
+  --color-text-secondary: #b0aea5;
+  --color-text-muted: #73726c;
+  --color-border: #3d3d3a;
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.25);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.35);
+}
+
+@layer base {
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family:
+      -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+      sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+    transition:
+      background 0.2s ease,
+      color 0.2s ease;
+  }
+  *:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
+
+@keyframes session-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(1.5);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-pulse {
+    animation: none !important;
+  }
+}
