@@ -560,6 +560,13 @@ DASH_UNIT="${MAIN_AGENT_ID}-dashboard"
 CHAN_UNIT="${MAIN_AGENT_ID}-channels"
 MORN_UNIT="${MAIN_AGENT_ID}-morning"
 
+# Claude bináris helye -- dinamikusan detektálva, hogy a service unit-ban
+# a helyes könyvtár kerüljön a PATH-ba (pl. ~/.local/bin, ~/.npm/bin, /usr/local/bin)
+CLAUDE_BIN="$(which claude 2>/dev/null || find "$HOME/.local/bin" "$HOME/.npm/bin" /usr/local/bin /usr/bin -name claude 2>/dev/null | head -1 || echo "")"
+CLAUDE_DIR="$(dirname "$CLAUDE_BIN" 2>/dev/null)"
+# Összesített PATH a service unit-okhoz: claude könyvtára + standard helyek
+SVC_PATH="${CLAUDE_DIR:+$CLAUDE_DIR:}$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+
 # ${DASH_UNIT}.service
 cat >"$SYSTEMD_DIR/${DASH_UNIT}.service" <<EOF
 [Unit]
@@ -574,7 +581,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=append:$INSTALL_DIR/store/dashboard.log
 StandardError=append:$INSTALL_DIR/store/dashboard.error.log
-Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$SVC_PATH
 Environment=HOME=$HOME
 
 [Install]
@@ -595,7 +602,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=append:$INSTALL_DIR/store/channels.log
 StandardError=append:$INSTALL_DIR/store/channels.error.log
-Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$SVC_PATH
 Environment=HOME=$HOME
 Environment=USER=$USER
 Environment=TERM=xterm-256color
@@ -614,7 +621,7 @@ Description=${BOT_NAME} Reggeli Napindito
 Type=oneshot
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/scripts/morning-briefing.sh
-Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$SVC_PATH
 Environment=HOME=$HOME
 EOF
 
