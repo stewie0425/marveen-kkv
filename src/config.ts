@@ -12,7 +12,7 @@ const env = readEnvFile()
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
 
-export const OWNER_NAME = env['OWNER_NAME'] ?? 'Szabolcs'
+export const OWNER_NAME = env['OWNER_NAME'] ?? 'Admin'
 export const BOT_NAME = env['BOT_NAME'] ?? 'Marveen'
 
 // Canonical identifier for the main agent in the DB, tmux sessions, plist

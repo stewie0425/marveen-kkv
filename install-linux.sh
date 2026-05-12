@@ -781,6 +781,80 @@ if [ "$DO_MIGRATE" = "i" ]; then
 fi
 
 # ─────────────────────────────────────────────
+# Cloudflare Tunnel (tavoli eleres, opcionalis)
+# ─────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}Tavoli eleres${NC}"
+echo -e "${DIM}  A dashboard most csak helyi halozaton eri el (http://localhost:3420).${NC}"
+echo -e "${DIM}  Cloudflare Tunnel biztonságos HTTPS hozzafereest ad barmely halozatrol${NC}"
+echo -e "${DIM}  -- router-konfig es port-forward nelkul, ingyenesen.${NC}"
+echo ""
+read -p "  Szeretnel tavolrol is elerni a rendszert? (Cloudflare Tunnel) (i/n) [n]: " DO_CLOUDFLARE
+DO_CLOUDFLARE=${DO_CLOUDFLARE:-n}
+
+if [ "$DO_CLOUDFLARE" = "i" ]; then
+  if command -v cloudflared &>/dev/null; then
+    ok "cloudflared mar telepitve: $(cloudflared --version 2>/dev/null | head -1)"
+  else
+    echo -e "  cloudflared telepitese..."
+    CF_ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+    CF_DEB_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}.deb"
+    if curl -fsSL -o /tmp/cloudflared.deb "$CF_DEB_URL" 2>/dev/null; then
+      sudo dpkg -i /tmp/cloudflared.deb -q 2>/dev/null || sudo apt-get install -f -y -qq 2>/dev/null
+      rm -f /tmp/cloudflared.deb
+      command -v cloudflared &>/dev/null && ok "cloudflared telepitve" || warn "cloudflared telepites sikertelen, kihagyva"
+    else
+      warn "cloudflared letoltese sikertelen. Kezzel: https://github.com/cloudflare/cloudflared/releases/latest"
+    fi
+  fi
+
+  if command -v cloudflared &>/dev/null; then
+    TUNNEL_UNIT="${MAIN_AGENT_ID}-tunnel"
+    cat >"$SYSTEMD_DIR/${TUNNEL_UNIT}.service" <<EOF
+[Unit]
+Description=${BOT_NAME} Cloudflare Tunnel
+After=network.target ${DASH_UNIT}.service
+Wants=${DASH_UNIT}.service
+
+[Service]
+Type=simple
+ExecStart=$(which cloudflared) tunnel --url http://localhost:3420 --no-autoupdate
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:$INSTALL_DIR/store/tunnel.log
+StandardError=append:$INSTALL_DIR/store/tunnel.log
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable "${TUNNEL_UNIT}" 2>/dev/null || true
+    systemctl --user start "${TUNNEL_UNIT}" 2>/dev/null || true
+
+    echo -e "  Varakozas a tunnel URL-re (max 20 mp)..."
+    TUNNEL_URL=""
+    for i in $(seq 1 20); do
+      sleep 1
+      TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$INSTALL_DIR/store/tunnel.log" 2>/dev/null | tail -1)
+      [ -n "$TUNNEL_URL" ] && break
+    done
+
+    if [ -n "$TUNNEL_URL" ]; then
+      ok "Cloudflare Tunnel aktiv: ${BLUE}${TUNNEL_URL}${NC}"
+      echo -e "  ${DIM}Ez egy ideiglenes URL -- rendszereindulas utan valtozhat.${NC}"
+      echo -e "  ${DIM}Allando URL: cloudflared tunnel login (Cloudflare fiok szukseges)${NC}"
+    else
+      ok "Cloudflare Tunnel elindult"
+      echo -e "  ${DIM}URL: journalctl --user -u ${TUNNEL_UNIT} | grep trycloudflare.com${NC}"
+    fi
+    echo -e "  ${DIM}Leallitas: systemctl --user stop ${TUNNEL_UNIT}${NC}"
+    echo -e "  ${DIM}Log: $INSTALL_DIR/store/tunnel.log${NC}"
+  fi
+else
+  echo -e "  ${DIM}Kihagyva. Kesobb: sudo apt-get install cloudflared && cloudflared tunnel --url http://localhost:3420${NC}"
+fi
+
+# ─────────────────────────────────────────────
 # Kesz!
 # ─────────────────────────────────────────────
 echo ""
