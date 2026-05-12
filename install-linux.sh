@@ -631,9 +631,11 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-# 1. linger eloszor: ez engedelyezi a user systemd sessiont boot utan is,
-#    es headless-en az aktualis script futasa alatt is szukseges lehet
-if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+# 1. linger eloszor: ez engedelyezi a user systemd sessiont boot utan is.
+#    LXC containerben / root usernel loginctl nem elerheto (no D-Bus) -- kihagyjuk.
+if [ "$(id -u)" = "0" ] || ! command -v loginctl &>/dev/null; then
+  warn "loginctl linger kihagyva (root user vagy LXC kornyezet -- nem szukseges)"
+elif loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
   ok "loginctl linger mar engedelyezve ($USER)"
 elif sudo loginctl enable-linger "$USER" 2>/dev/null; then
   ok "loginctl linger engedelyezve ($USER)"
