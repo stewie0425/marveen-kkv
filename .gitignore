@@ -1,6 +1,6 @@
 # Dependencies & build
 node_modules/
-dist/
+/dist/
 
 # web-react: React dashboard (node_modules excluded, dist/ is committed)
 web-react/node_modules/
