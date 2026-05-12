@@ -127,17 +127,42 @@ ok "zstd $(zstd --version 2>/dev/null | head -1)"
 echo ""
 echo -e "${BOLD}[2/7] Claude Code + Bun telepitese...${NC}"
 
-# ~/.local/bin eloszor, hogy a claude check mar jo PATH-on fusson
+# ~/.local/bin + npm global bin eloszor PATH-ba
 ensure_in_rc '.local/bin' 'export PATH="$HOME/.local/bin:$PATH"'
 export PATH="$HOME/.local/bin:$PATH"
+NPM_GLOBAL_BIN=$(npm bin -g 2>/dev/null || npm config get prefix 2>/dev/null | sed 's|$|/bin|')
+[ -n "$NPM_GLOBAL_BIN" ] && export PATH="$NPM_GLOBAL_BIN:$PATH"
+
+# npm prefix -> ~/.local hogy a claude binarisok ~/.local/bin-be keruljenek
+# (root-on rendszerszintu npm prefix /usr/local lenne, ami kesobb PATH-problemat okoz)
+npm config set prefix "$HOME/.local" 2>/dev/null || true
 
 if command -v claude &>/dev/null; then
-  ok "claude mar telepitve: $(claude --version 2>/dev/null || echo 'ok')"
+  ok "claude mar telepitve: $(claude --version 2>/dev/null || echo 'ok') ($(which claude))"
 else
-  echo -e "  Claude Code telepitese (~/.local/bin)..."
+  echo -e "  Claude Code telepitese..."
   curl -fsSL https://claude.ai/install.sh | bash
   hash -r
-  ok "claude telepitve -> ~/.local/bin/claude"
+fi
+
+# Valodi lokacio-detektalas -- a telepito kulonbozo helyekre rakhatja a binarist
+CLAUDE_ACTUAL=""
+for _candidate in \
+    "$HOME/.local/bin/claude" \
+    "/usr/local/bin/claude" \
+    "$(npm bin -g 2>/dev/null)/claude" \
+    "/usr/bin/claude"; do
+  [ -x "$_candidate" ] && CLAUDE_ACTUAL="$_candidate" && break
+done
+[ -z "$CLAUDE_ACTUAL" ] && CLAUDE_ACTUAL=$(find "$HOME/.local/bin" /usr/local/bin /usr/bin -name "claude" -type f 2>/dev/null | head -1)
+
+if [ -n "$CLAUDE_ACTUAL" ]; then
+  CLAUDE_DIR="$(dirname "$CLAUDE_ACTUAL")"
+  export PATH="$CLAUDE_DIR:$PATH"
+  ensure_in_rc "claude-bin" "export PATH=\"$CLAUDE_DIR:\$PATH\""
+  ok "claude: $CLAUDE_ACTUAL ($(claude --version 2>/dev/null || echo 'ok'))"
+else
+  warn "claude binarist nem talaltam -- manualis javitas: curl -fsSL https://claude.ai/install.sh | bash"
 fi
 
 # Linuxbrew (ha telepitve van)
