@@ -54,8 +54,12 @@ export function useUpstreamStatus() {
 export function useSyncUpstreamRequest() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async () => {
-      const res = await apiFetch('/api/updates/sync-upstream-request', { method: 'POST' })
+    mutationFn: async (payload: { commits: string[] }) => {
+      const res = await apiFetch('/api/updates/sync-upstream-request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
       return data
