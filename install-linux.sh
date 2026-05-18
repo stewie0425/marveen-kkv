@@ -114,55 +114,23 @@ ok "python3 $(python3 --version | awk '{print $2}')"
 ok "tmux $(tmux -V | awk '{print $2}')"
 ok "unzip" $(unzip -v | awk 'NR==1 {print $2}')
 
-# zstd: unconditional frissites -- command -v alapu check nem eleg,
-# mert regi dependency-bol telepult verzio nem tamogatja az Ollama extractiot
-echo -e "  zstd frissitese..."
-sudo apt-get update -qq 2>/dev/null
-sudo apt-get install -y zstd -qq 2>/dev/null
-ok "zstd $(zstd --version 2>/dev/null | head -1)"
-
 # ─────────────────────────────────────────────
 # [2/7] Claude Code + Bun telepitese
 # ─────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}[2/7] Claude Code + Bun telepitese...${NC}"
 
-# ~/.local/bin + npm global bin eloszor PATH-ba
+# ~/.local/bin eloszor, hogy a claude check mar jo PATH-on fusson
 ensure_in_rc '.local/bin' 'export PATH="$HOME/.local/bin:$PATH"'
 export PATH="$HOME/.local/bin:$PATH"
-NPM_GLOBAL_BIN=$(npm bin -g 2>/dev/null || npm config get prefix 2>/dev/null | sed 's|$|/bin|')
-[ -n "$NPM_GLOBAL_BIN" ] && export PATH="$NPM_GLOBAL_BIN:$PATH"
-
-# npm prefix -> ~/.local hogy a claude binarisok ~/.local/bin-be keruljenek
-# (root-on rendszerszintu npm prefix /usr/local lenne, ami kesobb PATH-problemat okoz)
-npm config set prefix "$HOME/.local" 2>/dev/null || true
 
 if command -v claude &>/dev/null; then
-  ok "claude mar telepitve: $(claude --version 2>/dev/null || echo 'ok') ($(which claude))"
+  ok "claude mar telepitve: $(claude --version 2>/dev/null || echo 'ok')"
 else
-  echo -e "  Claude Code telepitese..."
+  echo -e "  Claude Code telepitese (~/.local/bin)..."
   curl -fsSL https://claude.ai/install.sh | bash
   hash -r
-fi
-
-# Valodi lokacio-detektalas -- a telepito kulonbozo helyekre rakhatja a binarist
-CLAUDE_ACTUAL=""
-for _candidate in \
-    "$HOME/.local/bin/claude" \
-    "/usr/local/bin/claude" \
-    "$(npm bin -g 2>/dev/null)/claude" \
-    "/usr/bin/claude"; do
-  [ -x "$_candidate" ] && CLAUDE_ACTUAL="$_candidate" && break
-done
-[ -z "$CLAUDE_ACTUAL" ] && CLAUDE_ACTUAL=$(find "$HOME/.local/bin" /usr/local/bin /usr/bin -name "claude" -type f 2>/dev/null | head -1)
-
-if [ -n "$CLAUDE_ACTUAL" ]; then
-  CLAUDE_DIR="$(dirname "$CLAUDE_ACTUAL")"
-  export PATH="$CLAUDE_DIR:$PATH"
-  ensure_in_rc "claude-bin" "export PATH=\"$CLAUDE_DIR:\$PATH\""
-  ok "claude: $CLAUDE_ACTUAL ($(claude --version 2>/dev/null || echo 'ok'))"
-else
-  warn "claude binarist nem talaltam -- manualis javitas: curl -fsSL https://claude.ai/install.sh | bash"
+  ok "claude telepitve -> ~/.local/bin/claude"
 fi
 
 # Linuxbrew (ha telepitve van)
@@ -416,7 +384,6 @@ CHANNEL_PROVIDER=${CHANNEL_PROVIDER}
 OWNER_NAME=${OWNER_NAME}
 BOT_NAME=${BOT_NAME}
 MAIN_AGENT_ID=${MAIN_AGENT_ID}
-WEB_HOST=0.0.0.0
 ENVEOF
 )
 if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
@@ -551,8 +518,6 @@ echo ""
 echo -e "${BOLD}[6/7] Ollama + Whisper...${NC}"
 
 # --- Ollama telepites ---
-# zstd kotelozo az Ollama installer extractiohoz -- garantalt install fuggetlenul az [1/7] pkg listetol
-sudo apt-get update -qq && sudo apt-get install -y zstd -qq 2>/dev/null || true
 echo -e "  Ollama ellenorzese (szemantikus memoria kereseshez)..."
 if command -v ollama &>/dev/null; then
   ok "ollama mar telepitve"
@@ -645,12 +610,17 @@ DASH_UNIT="${MAIN_AGENT_ID}-dashboard"
 CHAN_UNIT="${MAIN_AGENT_ID}-channels"
 MORN_UNIT="${MAIN_AGENT_ID}-morning"
 
-# Claude bináris helye -- dinamikusan detektálva, hogy a service unit-ban
-# a helyes könyvtár kerüljön a PATH-ba (pl. ~/.local/bin, ~/.npm/bin, /usr/local/bin)
-CLAUDE_BIN="$(which claude 2>/dev/null || find "$HOME/.local/bin" "$HOME/.npm/bin" /usr/local/bin /usr/bin -name claude 2>/dev/null | head -1 || echo "")"
-CLAUDE_DIR="$(dirname "$CLAUDE_BIN" 2>/dev/null)"
-# Összesített PATH a service unit-okhoz: claude könyvtára + standard helyek
-SVC_PATH="${CLAUDE_DIR:+$CLAUDE_DIR:}$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+# Detect the host timezone so the scheduled-task runner (which reads
+# cron expressions in Node's local TZ) fires at the operator's wall
+# clock, not the VPS UTC default. If detection fails or the host is
+# already UTC, we emit a comment instead so the unit stays explicit.
+SYSTEM_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)"
+SYSTEM_TZ="${SYSTEM_TZ%$'\n'}"
+if [ -n "$SYSTEM_TZ" ] && [ "$SYSTEM_TZ" != "Etc/UTC" ] && [ "$SYSTEM_TZ" != "UTC" ]; then
+  TZ_LINE="Environment=TZ=$SYSTEM_TZ"
+else
+  TZ_LINE="# no explicit TZ detected; inheriting host default"
+fi
 
 # ${DASH_UNIT}.service
 cat >"$SYSTEMD_DIR/${DASH_UNIT}.service" <<EOF
@@ -666,8 +636,9 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=append:$INSTALL_DIR/store/dashboard.log
 StandardError=append:$INSTALL_DIR/store/dashboard.error.log
-Environment=PATH=$SVC_PATH
+Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=$HOME
+${TZ_LINE}
 
 [Install]
 WantedBy=default.target
@@ -687,11 +658,12 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=append:$INSTALL_DIR/store/channels.log
 StandardError=append:$INSTALL_DIR/store/channels.error.log
-Environment=PATH=$SVC_PATH
+Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=$HOME
 Environment=USER=$USER
 Environment=TERM=xterm-256color
 Environment=LANG=${LANG:-en_US.UTF-8}
+${TZ_LINE}
 
 [Install]
 WantedBy=default.target
@@ -706,8 +678,9 @@ Description=${BOT_NAME} Reggeli Napindito
 Type=oneshot
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/scripts/morning-briefing.sh
-Environment=PATH=$SVC_PATH
+Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=$HOME
+${TZ_LINE}
 EOF
 
 # ${MORN_UNIT}.timer
@@ -724,11 +697,9 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-# 1. linger eloszor: ez engedelyezi a user systemd sessiont boot utan is.
-#    LXC containerben / root usernel loginctl nem elerheto (no D-Bus) -- kihagyjuk.
-if [ "$(id -u)" = "0" ] || ! command -v loginctl &>/dev/null; then
-  warn "loginctl linger kihagyva (root user vagy LXC kornyezet -- nem szukseges)"
-elif loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+# 1. linger eloszor: ez engedelyezi a user systemd sessiont boot utan is,
+#    es headless-en az aktualis script futasa alatt is szukseges lehet
+if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
   ok "loginctl linger mar engedelyezve ($USER)"
 elif sudo loginctl enable-linger "$USER" 2>/dev/null; then
   ok "loginctl linger engedelyezve ($USER)"
@@ -885,80 +856,6 @@ if [ "$DO_MIGRATE" = "i" ]; then
 fi
 
 # ─────────────────────────────────────────────
-# Cloudflare Tunnel (tavoli eleres, opcionalis)
-# ─────────────────────────────────────────────
-echo ""
-echo -e "${BOLD}Tavoli eleres${NC}"
-echo -e "${DIM}  A dashboard most csak helyi halozaton eri el (http://localhost:3420).${NC}"
-echo -e "${DIM}  Cloudflare Tunnel biztonságos HTTPS hozzafereest ad barmely halozatrol${NC}"
-echo -e "${DIM}  -- router-konfig es port-forward nelkul, ingyenesen.${NC}"
-echo ""
-read -p "  Szeretnel tavolrol is elerni a rendszert? (Cloudflare Tunnel) (i/n) [n]: " DO_CLOUDFLARE
-DO_CLOUDFLARE=${DO_CLOUDFLARE:-n}
-
-if [ "$DO_CLOUDFLARE" = "i" ]; then
-  if command -v cloudflared &>/dev/null; then
-    ok "cloudflared mar telepitve: $(cloudflared --version 2>/dev/null | head -1)"
-  else
-    echo -e "  cloudflared telepitese..."
-    CF_ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-    CF_DEB_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}.deb"
-    if curl -fsSL -o /tmp/cloudflared.deb "$CF_DEB_URL" 2>/dev/null; then
-      sudo dpkg -i /tmp/cloudflared.deb -q 2>/dev/null || sudo apt-get install -f -y -qq 2>/dev/null
-      rm -f /tmp/cloudflared.deb
-      command -v cloudflared &>/dev/null && ok "cloudflared telepitve" || warn "cloudflared telepites sikertelen, kihagyva"
-    else
-      warn "cloudflared letoltese sikertelen. Kezzel: https://github.com/cloudflare/cloudflared/releases/latest"
-    fi
-  fi
-
-  if command -v cloudflared &>/dev/null; then
-    TUNNEL_UNIT="${MAIN_AGENT_ID}-tunnel"
-    cat >"$SYSTEMD_DIR/${TUNNEL_UNIT}.service" <<EOF
-[Unit]
-Description=${BOT_NAME} Cloudflare Tunnel
-After=network.target ${DASH_UNIT}.service
-Wants=${DASH_UNIT}.service
-
-[Service]
-Type=simple
-ExecStart=$(which cloudflared) tunnel --url http://localhost:3420 --no-autoupdate
-Restart=on-failure
-RestartSec=10
-StandardOutput=append:$INSTALL_DIR/store/tunnel.log
-StandardError=append:$INSTALL_DIR/store/tunnel.log
-
-[Install]
-WantedBy=default.target
-EOF
-    systemctl --user daemon-reload
-    systemctl --user enable "${TUNNEL_UNIT}" 2>/dev/null || true
-    systemctl --user start "${TUNNEL_UNIT}" 2>/dev/null || true
-
-    echo -e "  Varakozas a tunnel URL-re (max 20 mp)..."
-    TUNNEL_URL=""
-    for i in $(seq 1 20); do
-      sleep 1
-      TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$INSTALL_DIR/store/tunnel.log" 2>/dev/null | tail -1)
-      [ -n "$TUNNEL_URL" ] && break
-    done
-
-    if [ -n "$TUNNEL_URL" ]; then
-      ok "Cloudflare Tunnel aktiv: ${BLUE}${TUNNEL_URL}${NC}"
-      echo -e "  ${DIM}Ez egy ideiglenes URL -- rendszereindulas utan valtozhat.${NC}"
-      echo -e "  ${DIM}Allando URL: cloudflared tunnel login (Cloudflare fiok szukseges)${NC}"
-    else
-      ok "Cloudflare Tunnel elindult"
-      echo -e "  ${DIM}URL: journalctl --user -u ${TUNNEL_UNIT} | grep trycloudflare.com${NC}"
-    fi
-    echo -e "  ${DIM}Leallitas: systemctl --user stop ${TUNNEL_UNIT}${NC}"
-    echo -e "  ${DIM}Log: $INSTALL_DIR/store/tunnel.log${NC}"
-  fi
-else
-  echo -e "  ${DIM}Kihagyva. Kesobb: sudo apt-get install cloudflared && cloudflared tunnel --url http://localhost:3420${NC}"
-fi
-
-# ─────────────────────────────────────────────
 # Kesz!
 # ─────────────────────────────────────────────
 echo ""
@@ -971,16 +868,11 @@ DASH_TOKEN=""
 if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
   DASH_TOKEN=$(cat "$INSTALL_DIR/store/.dashboard-token")
 fi
-LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-[ -z "$LOCAL_IP" ] && LOCAL_IP=$(ip route get 1 2>/dev/null | awk '{print $(NF-2)}')
-[ -z "$LOCAL_IP" ] && LOCAL_IP=$(ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d/ -f1)
-[ -z "$LOCAL_IP" ] && LOCAL_IP=$(hostname -I 2>/dev/null | tr " " "\n" | grep -v "^127\|^::" | head -1)
-[ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
 if [ -n "$DASH_TOKEN" ]; then
-  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://${LOCAL_IP}:3420/?token=${DASH_TOKEN}${NC}"
+  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:3420/?token=${DASH_TOKEN}${NC}"
   echo -e "  ${DIM}(Nyisd meg egyszer, utana a bongeszo megjegyzi a tokent)${NC}"
 else
-  echo -e "  ${BOLD}Dashboard:${NC} http://${LOCAL_IP}:3420"
+  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:3420"
   echo -e "  ${DIM}(A tokenes URL-t a szerver logban talalod)${NC}"
 fi
 echo -e "  ${BOLD}Telegram:${NC} Irj a botodnak!"
