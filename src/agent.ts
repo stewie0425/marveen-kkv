@@ -1,4 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { execSync } from 'node:child_process'
 import { PROJECT_ROOT } from './config.js'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -31,6 +34,45 @@ const CLAUDE_BINARY = resolveClaudeBinary()
 // corrupting the target file the caller goes on to write.
 const DEFAULT_DISALLOWED_TOOLS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'Task']
 
+// The bundled SDK's runtime libc detection picks the linux-x64-musl variant
+// even on glibc Ubuntu/Debian/RHEL hosts, so its native binary fails to
+// spawn ("ld-musl-* not found"). We pick the right subpackage ourselves and
+// forward its absolute path through pathToClaudeCodeExecutable.
+function detectLinuxLibc(): 'glibc' | 'musl' | 'unknown' {
+  if (process.platform !== 'linux') return 'unknown'
+  try {
+    const out = execSync('ldd --version 2>&1', { encoding: 'utf-8' })
+    return /musl/i.test(out) ? 'musl' : 'glibc'
+  } catch {
+    return 'unknown'
+  }
+}
+
+let cachedClaudeCodeBin: string | undefined | null = null
+function resolveClaudeCodeBin(): string | undefined {
+  if (cachedClaudeCodeBin !== null) return cachedClaudeCodeBin
+  if (process.env.CLAUDE_CODE_BIN) {
+    cachedClaudeCodeBin = process.env.CLAUDE_CODE_BIN
+    return cachedClaudeCodeBin
+  }
+  if (process.platform !== 'linux' || process.arch !== 'x64') {
+    cachedClaudeCodeBin = undefined
+    return undefined
+  }
+  const libc = detectLinuxLibc()
+  if (libc === 'unknown') {
+    cachedClaudeCodeBin = undefined
+    return undefined
+  }
+  const variant = libc === 'musl' ? 'linux-x64-musl' : 'linux-x64'
+  const bin = join(
+    PROJECT_ROOT, 'node_modules', '@anthropic-ai',
+    `claude-agent-sdk-${variant}`, 'claude',
+  )
+  cachedClaudeCodeBin = existsSync(bin) ? bin : undefined
+  return cachedClaudeCodeBin
+}
+
 export async function runAgent(
   message: string,
   sessionId?: string,
@@ -47,6 +89,8 @@ export async function runAgent(
     abortController.abort()
   }, AGENT_TIMEOUT_MS)
 
+  const claudeCodeBin = resolveClaudeCodeBin()
+
   try {
     const events = query({
       prompt: message,
@@ -54,7 +98,7 @@ export async function runAgent(
         abortController,
         cwd: PROJECT_ROOT,
         permissionMode: 'bypassPermissions',
-        ...(CLAUDE_BINARY ? { pathToClaudeCodeExecutable: CLAUDE_BINARY } : {}),
+        ...(claudeCodeBin ? { pathToClaudeCodeExecutable: claudeCodeBin } : {}),
         ...(allowTools ? {} : { disallowedTools: DEFAULT_DISALLOWED_TOOLS }),
         ...(sessionId ? { resume: sessionId } : {}),
       },
