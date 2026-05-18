@@ -172,7 +172,25 @@ Write-Host ""
 Write-Host "[5/5] Konfiguráció..." -ForegroundColor White
 
 $ownerName = Read-Host "  Mi a neved?"
-$botToken = Read-Host "  Telegram bot token (vagy hagyd üresen)"
+
+Write-Host ""
+Write-Host "  Csatorna beallitas:" -ForegroundColor White
+Write-Host "    1. Telegram (alapertelmezett)" -ForegroundColor Cyan
+Write-Host "    2. Slack" -ForegroundColor Cyan
+$provChoice = Read-Host "  Valassz (1/2) [1]"
+if ($provChoice -eq "2") { $channelProvider = "slack" } else { $channelProvider = "telegram" }
+
+$botToken = ""
+$slackBotToken = ""
+$slackAppToken = ""
+
+if ($channelProvider -eq "telegram") {
+    $botToken = Read-Host "  Telegram bot token (vagy hagyd üresen)"
+} else {
+    $slackBotToken = Read-Host "  Bot Token (xoxb-...)"
+    $slackAppToken = Read-Host "  App-Level Token (xapp-...)"
+}
+
 $chatId = "0"
 
 wsl bash -c @"
@@ -180,11 +198,17 @@ cd $installPath
 
 # Create .env
 (umask 077 && cat > .env << 'ENVEOF'
-TELEGRAM_BOT_TOKEN=$botToken
-ALLOWED_CHAT_ID=$chatId
+CHANNEL_PROVIDER=$channelProvider
 OWNER_NAME=$ownerName
 ENVEOF
 )
+if [ '$channelProvider' = 'telegram' ]; then
+  echo 'TELEGRAM_BOT_TOKEN=$botToken' >> .env
+  echo 'ALLOWED_CHAT_ID=$chatId' >> .env
+else
+  echo 'SLACK_BOT_TOKEN=$slackBotToken' >> .env
+  echo 'SLACK_APP_TOKEN=$slackAppToken' >> .env
+fi
 chmod 600 .env
 echo '  ✓ .env létrehozva (chmod 600)'
 
@@ -197,18 +221,51 @@ fi
 # Create directories
 mkdir -p store agents
 
-# Setup Telegram
-if [ -n '$botToken' ]; then
-    mkdir -p ~/.claude/channels/telegram
-    (umask 077 && echo 'TELEGRAM_BOT_TOKEN=$botToken' > ~/.claude/channels/telegram/.env)
-    chmod 600 ~/.claude/channels/telegram/.env
-    echo '{"dmPolicy":"pairing","allowFrom":[],"groups":{},"pending":{}}' > ~/.claude/channels/telegram/access.json
+# Setup channel state
+CHANNEL_DIR=~/.claude/channels/$channelProvider
+mkdir -p "\$CHANNEL_DIR"
+if [ '$channelProvider' = 'telegram' ] && [ -n '$botToken' ]; then
+    (umask 077 && echo 'TELEGRAM_BOT_TOKEN=$botToken' > "\$CHANNEL_DIR/.env")
+    chmod 600 "\$CHANNEL_DIR/.env"
+    echo '{"dmPolicy":"pairing","allowFrom":[],"groups":{},"pending":{}}' > "\$CHANNEL_DIR/access.json"
     echo '  ✓ Telegram csatorna konfigurálva'
+elif [ '$channelProvider' = 'slack' ] && [ -n '$slackBotToken' ]; then
+    (umask 077 && printf 'SLACK_BOT_TOKEN=$slackBotToken\nSLACK_APP_TOKEN=$slackAppToken\n' > "\$CHANNEL_DIR/.env")
+    chmod 600 "\$CHANNEL_DIR/.env"
+    echo '{"dmPolicy":"pairing","allowFrom":[],"groups":{},"pending":{}}' > "\$CHANNEL_DIR/access.json"
+    echo '  ✓ Slack csatorna konfigurálva'
 fi
 
-# Install Telegram plugin
-claude plugin install telegram@claude-plugins-official 2>/dev/null || true
-echo '  ✓ Telegram plugin'
+# Install channel plugin
+if [ '$channelProvider' = 'telegram' ]; then
+    claude plugin marketplace add anthropics/claude-plugins-official 2>/dev/null || true
+    claude plugin install telegram@claude-plugins-official 2>/dev/null || true
+    echo '  ✓ Telegram plugin'
+else
+    claude plugin marketplace add jeremylongshore/claude-code-slack-channel 2>/dev/null || true
+    claude plugin install slack@jeremylongshore/claude-code-slack-channel 2>/dev/null || true
+    echo '  ✓ Slack plugin'
+fi
+
+# Pre-accept Claude Code first-run dialogs so the tmux-spawned headless
+# session (Telegram bridge) doesn't park on them forever. Without this,
+# the first launch hits "Bypass Permissions mode" + "Trust this folder"
+# prompts on a non-interactive TTY and stays stuck.
+mkdir -p ~/.claude
+node -e '
+const fs = require("fs"), os = require("os"), path = require("path");
+const cj = path.join(os.homedir(), ".claude.json");
+let d = {}; try { d = JSON.parse(fs.readFileSync(cj, "utf8")); } catch {}
+d.hasCompletedOnboarding = true;
+if (!d.theme) d.theme = "dark";
+fs.writeFileSync(cj, JSON.stringify(d, null, 2), { mode: 0o600 });
+const sj = path.join(os.homedir(), ".claude", "settings.json");
+let s = {}; try { s = JSON.parse(fs.readFileSync(sj, "utf8")); } catch {}
+s.skipDangerousModePermissionPrompt = true;
+fs.mkdirSync(path.dirname(sj), { recursive: true });
+fs.writeFileSync(sj, JSON.stringify(s, null, 2), { mode: 0o600 });
+console.log("  ✓ Claude Code first-run flags");
+'
 "@
 
 # Done!
@@ -223,8 +280,9 @@ Write-Host ""
 Write-Host "  Dashboard:" -ForegroundColor White
 Write-Host "    http://localhost:3420" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Telegram bridge indítása:" -ForegroundColor White
-Write-Host "    wsl bash -c 'cd $installPath && tmux new-session -d -s marveen-channels ""claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official""'" -ForegroundColor Cyan
+Write-Host "  Channel bridge indítása:" -ForegroundColor White
+Write-Host "    wsl bash -c 'cd $installPath && bash scripts/channels.sh &'" -ForegroundColor Cyan
+Write-Host "    (a channels.sh tartalmazza a first-run dialog auto-accept guardot)" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Frissítés:" -ForegroundColor White
 Write-Host "    wsl bash -c 'cd $installPath && ./update.sh'" -ForegroundColor Cyan

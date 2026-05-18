@@ -105,18 +105,14 @@ if ! command -v claude &>/dev/null; then
 fi
 echo -e "  ${GREEN}✓${NC} Claude Code CLI"
 
-# Step 2: Claude authentication
-echo ""
-echo -e "${BOLD}[2/7] Claude bejelentkezes${NC}"
-echo -e "${DIM}  Ha meg nem jelentkeztel be, most megteheted.${NC}"
-read -p "  Szeretned most bejelentkezni? (i/n) " DO_AUTH
-if [ "$DO_AUTH" = "i" ]; then
-  claude auth login
-fi
-
-# Mark the Claude Code first-run wizard as completed so the tmux-spawned
-# `claude --channels ...` process doesn't stop on the theme picker and
-# block the Telegram plugin from ever initializing.
+# Step 2: Claude Code first-run flags (BEFORE auth login)
+#
+# Reason: ha a `claude auth login` browser-flow megakad (timeout, Ctrl+C,
+# vagy a felhasznalo nem klikkel a "Trust this browser?"-ben), a `set -e`
+# alatt a script kilep es a flag-set NEM fut le -- onnantol a tmux-spawned
+# headless session orokre parkol a "Trust this folder" / theme-picker /
+# Bypass Permissions promptokon. Tehat a flag-set FOLY-RA `auth login`
+# ELOTT, hogy ezek a defensive default-ok mindenkeppen a helyukre keruljenek.
 mkdir -p "$HOME/.claude"
 python3 - <<'PYEOF'
 import json, os, pathlib
@@ -136,12 +132,6 @@ try:
 except Exception:
     pass
 PYEOF
-
-# Pre-accept the --dangerously-skip-permissions confirmation dialog so the
-# headless `claude --channels ...` session in scripts/channels.sh doesn't
-# park on it forever (the dialog needs interactive Enter and there's no TTY
-# attached). Claude Code maintains this flag itself once accepted manually,
-# but we have to seed it before the first launchd-spawned session.
 python3 - <<'PYEOF'
 import json, os, pathlib
 p = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
@@ -159,6 +149,25 @@ try:
 except Exception:
     pass
 PYEOF
+echo -e "  ${GREEN}✓${NC} Claude Code first-run flags pre-set"
+
+# Step 2b: Claude authentication (kept tolerant -- ha megakad, folytatjuk)
+echo ""
+echo -e "${BOLD}[2/7] Claude bejelentkezes${NC}"
+echo -e "${DIM}  Ha meg nem jelentkeztel be, most megteheted.${NC}"
+echo -e "${DIM}  Ha a browser-os authorize-flow megakad, Ctrl+C-vel kilephetsz${NC}"
+echo -e "${DIM}  -- a telepites folytatodik, kesobb manualisan tudsz belepni.${NC}"
+read -p "  Szeretned most bejelentkezni? (i/n) " DO_AUTH
+if [ "$DO_AUTH" = "i" ]; then
+  set +e
+  claude auth login
+  AUTH_RC=$?
+  set -e
+  if [ "$AUTH_RC" -ne 0 ]; then
+    echo -e "  ${ORANGE}⚠${NC} Auth login nem fejezodott be sikeresen (exit $AUTH_RC)."
+    echo -e "  ${DIM}A telepites folytatodik. Belepheted kesobb: ${BOLD}claude auth login${NC}"
+  fi
+fi
 echo -e "  ${GREEN}✓${NC} Claude Code first-run beallitas kesz"
 
 # Step 3: Personal info
@@ -169,16 +178,47 @@ read -p "  Mi a neved? " OWNER_NAME
 # It will be set automatically during the Telegram pairing flow.
 CHAT_ID="0"
 
-# Step 4: Telegram bot setup
+# Step 4: Channel provider setup
 echo ""
-echo -e "${BOLD}[4/7] Telegram bot beallitas${NC}"
-echo -e "${DIM}  Az AI asszisztensed Telegramon kommunikal veled.${NC}"
-echo -e "${DIM}  1. Nyisd meg a @BotFather-t a Telegramban${NC}"
-echo -e "${DIM}  2. Ird be: /newbot${NC}"
-echo -e "${DIM}  3. Adj nevet a botodnak${NC}"
-echo -e "${DIM}  4. Masold ide a kapott tokent:${NC}"
+echo -e "${BOLD}[4/7] Csatorna beallitas${NC}"
+echo -e "${DIM}  Melyik csatornan kommunikaljon az AI asszisztensed?${NC}"
+echo -e "  ${BOLD}1.${NC} Telegram (alapertelmezett)"
+echo -e "  ${BOLD}2.${NC} Slack"
 echo ""
-read -p "  Telegram bot token (vagy hagyd uresen, kesobb is beallithatod): " BOT_TOKEN
+read -p "  Valassz (1/2) [1]: " PROVIDER_CHOICE
+PROVIDER_CHOICE=${PROVIDER_CHOICE:-1}
+if [ "$PROVIDER_CHOICE" = "2" ]; then
+  CHANNEL_PROVIDER="slack"
+else
+  CHANNEL_PROVIDER="telegram"
+fi
+echo -e "  ${GREEN}✓${NC} Csatorna: $CHANNEL_PROVIDER"
+
+BOT_TOKEN=""
+SLACK_BOT_TOKEN=""
+SLACK_APP_TOKEN=""
+
+if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
+  echo ""
+  echo -e "${DIM}  Az AI asszisztensed Telegramon kommunikal veled.${NC}"
+  echo -e "${DIM}  1. Nyisd meg a @BotFather-t a Telegramban${NC}"
+  echo -e "${DIM}  2. Ird be: /newbot${NC}"
+  echo -e "${DIM}  3. Adj nevet a botodnak${NC}"
+  echo -e "${DIM}  4. Masold ide a kapott tokent:${NC}"
+  echo ""
+  read -p "  Telegram bot token (vagy hagyd uresen, kesobb is beallithatod): " BOT_TOKEN
+else
+  echo ""
+  echo -e "${DIM}  Az AI asszisztensed Slack-en kommunikal veled.${NC}"
+  echo -e "${DIM}  1. Hozz letre egy Slack App-ot: api.slack.com/apps${NC}"
+  echo -e "${DIM}  2. Engedeld a Socket Mode-ot${NC}"
+  echo -e "${DIM}  3. Adj hozza scope-okat: chat:write, channels:read, files:write${NC}"
+  echo -e "${DIM}  4. Installald a workspace-be${NC}"
+  echo ""
+  read -p "  Bot Token (xoxb-...): " SLACK_BOT_TOKEN
+  read -p "  App-Level Token (xapp-...): " SLACK_APP_TOKEN
+fi
+
 read -p "  Mi legyen a botod neve? [Marveen]: " BOT_NAME
 BOT_NAME=${BOT_NAME:-"Marveen"}
 
@@ -216,13 +256,20 @@ echo -e "${BOLD}[6/7] Konfiguracio letrehozasa...${NC}"
 # Create .env
 (umask 077 && cat > "$INSTALL_DIR/.env" << ENVEOF
 # Main agent konfiguracio
-TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
-ALLOWED_CHAT_ID=${CHAT_ID}
+CHANNEL_PROVIDER=${CHANNEL_PROVIDER}
 OWNER_NAME=${OWNER_NAME}
 BOT_NAME=${BOT_NAME}
 MAIN_AGENT_ID=${MAIN_AGENT_ID}
 ENVEOF
 )
+# Append provider-specific tokens
+if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
+  echo "TELEGRAM_BOT_TOKEN=${BOT_TOKEN}" >> "$INSTALL_DIR/.env"
+  echo "ALLOWED_CHAT_ID=${CHAT_ID}" >> "$INSTALL_DIR/.env"
+else
+  echo "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}" >> "$INSTALL_DIR/.env"
+  echo "SLACK_APP_TOKEN=${SLACK_APP_TOKEN}" >> "$INSTALL_DIR/.env"
+fi
 chmod 600 "$INSTALL_DIR/.env"
 echo -e "  ${GREEN}✓${NC} .env letrehozva (chmod 600)"
 
@@ -252,13 +299,41 @@ if [ -f "$INSTALL_DIR/templates/SOUL.md.template" ] && [ ! -f "$INSTALL_DIR/SOUL
   echo -e "  ${GREEN}✓${NC} SOUL.md generalva"
 fi
 
-# Setup Telegram channel
-if [ -n "$BOT_TOKEN" ] && [ "$BOT_TOKEN" != "" ]; then
-  TELEGRAM_DIR="$HOME/.claude/channels/telegram"
-  mkdir -p "$TELEGRAM_DIR"
-  (umask 077 && echo "TELEGRAM_BOT_TOKEN=$BOT_TOKEN" > "$TELEGRAM_DIR/.env")
-  chmod 600 "$TELEGRAM_DIR/.env"
-  cat > "$TELEGRAM_DIR/access.json" << ACCESSEOF
+# Scaffold default scheduled tasks into ~/.claude/scheduled-tasks/. Templates
+# carry {{MAIN_AGENT_ID}} placeholders so tasks target the user's chosen agent
+# slug rather than hardcoded "marveen". Skip task dirs that already exist --
+# never overwrite user customizations.
+SCHED_TPL_DIR="$INSTALL_DIR/templates/scheduled-tasks"
+SCHED_TARGET_DIR="$HOME/.claude/scheduled-tasks"
+if [ -d "$SCHED_TPL_DIR" ]; then
+  mkdir -p "$SCHED_TARGET_DIR"
+  for tpl in "$SCHED_TPL_DIR"/*/; do
+    [ -d "$tpl" ] || continue
+    task_name=$(basename "$tpl")
+    target="$SCHED_TARGET_DIR/$task_name"
+    if [ -d "$target" ]; then
+      continue
+    fi
+    mkdir -p "$target"
+    for f in "$tpl"*; do
+      [ -f "$f" ] || continue
+      sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+          -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
+          -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
+          "$f" > "$target/$(basename "$f")"
+    done
+    echo -e "  ${GREEN}✓${NC} Utemezett feladat scaffoldolva: $task_name"
+  done
+fi
+
+# Setup channel state directory
+CHANNEL_DIR="$HOME/.claude/channels/$CHANNEL_PROVIDER"
+mkdir -p "$CHANNEL_DIR"
+
+if [ "$CHANNEL_PROVIDER" = "telegram" ] && [ -n "$BOT_TOKEN" ]; then
+  (umask 077 && echo "TELEGRAM_BOT_TOKEN=$BOT_TOKEN" > "$CHANNEL_DIR/.env")
+  chmod 600 "$CHANNEL_DIR/.env"
+  cat > "$CHANNEL_DIR/access.json" << ACCESSEOF
 {
   "dmPolicy": "pairing",
   "allowFrom": [],
@@ -267,24 +342,46 @@ if [ -n "$BOT_TOKEN" ] && [ "$BOT_TOKEN" != "" ]; then
 }
 ACCESSEOF
   echo -e "  ${GREEN}✓${NC} Telegram csatorna konfigurálva"
+elif [ "$CHANNEL_PROVIDER" = "slack" ] && [ -n "$SLACK_BOT_TOKEN" ]; then
+  (umask 077 && cat > "$CHANNEL_DIR/.env" << SLACKENVEOF
+SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN
+SLACK_APP_TOKEN=$SLACK_APP_TOKEN
+SLACKENVEOF
+  )
+  chmod 600 "$CHANNEL_DIR/.env"
+  cat > "$CHANNEL_DIR/access.json" << ACCESSEOF
+{
+  "dmPolicy": "pairing",
+  "allowFrom": [],
+  "groups": {},
+  "pending": {}
+}
+ACCESSEOF
+  echo -e "  ${GREEN}✓${NC} Slack csatorna konfigurálva"
 fi
 
-# Install Telegram plugin
-echo -e "  Telegram plugin telepites..."
-# Ensure plugin marketplace is configured (idempotent: ignore "already added")
-claude plugin marketplace add anthropics/claude-plugins-official 2>/dev/null || true
-# Install the plugin (retry once if fails)
-if claude plugin install telegram@claude-plugins-official 2>/dev/null; then
-  echo -e "  ${GREEN}✓${NC} Telegram plugin telepitve"
+# Install channel plugin
+if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
+  PLUGIN_MARKETPLACE="anthropics/claude-plugins-official"
+  PLUGIN_ID="telegram@claude-plugins-official"
+else
+  PLUGIN_MARKETPLACE="jeremylongshore/claude-code-slack-channel"
+  PLUGIN_ID="slack@jeremylongshore/claude-code-slack-channel"
+fi
+
+echo -e "  ${CHANNEL_PROVIDER} plugin telepites..."
+claude plugin marketplace add "$PLUGIN_MARKETPLACE" 2>/dev/null || true
+if claude plugin install "$PLUGIN_ID" 2>/dev/null; then
+  echo -e "  ${GREEN}✓${NC} ${CHANNEL_PROVIDER} plugin telepitve"
 else
   echo -e "  ${ORANGE}Elso probalkozas sikertelen, ujraprobalok...${NC}"
   sleep 2
-  if claude plugin install telegram@claude-plugins-official 2>/dev/null; then
-    echo -e "  ${GREEN}✓${NC} Telegram plugin telepitve (masodik probalkozesal)"
+  if claude plugin install "$PLUGIN_ID" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} ${CHANNEL_PROVIDER} plugin telepitve (masodik probalkozesal)"
   else
-    echo -e "  ${RED}✗${NC} Telegram plugin telepites sikertelen."
+    echo -e "  ${RED}✗${NC} ${CHANNEL_PROVIDER} plugin telepites sikertelen."
     echo -e "  ${BOLD}Futtasd kesobb kezzel:${NC}"
-    echo -e "  ${BLUE}claude plugin install telegram@claude-plugins-official${NC}"
+    echo -e "  ${BLUE}claude plugin install ${PLUGIN_ID}${NC}"
     echo ""
   fi
 fi
@@ -462,25 +559,26 @@ launchctl load "$PLIST_DIR/${DASHBOARD_PLIST}.plist" 2>/dev/null || true
 launchctl load "$PLIST_DIR/${CHANNELS_PLIST}.plist" 2>/dev/null || true
 echo -e "  ${GREEN}✓${NC} Szolgaltatasok elinditva"
 
-# Verify Telegram plugin is working
+# Verify channel plugin is working
 sleep 3
 echo ""
 echo -e "${BOLD}Ellenorzes...${NC}"
-if ! command -v bun &>/dev/null; then
+if [ "$CHANNEL_PROVIDER" = "telegram" ] && ! command -v bun &>/dev/null; then
   echo -e "  ${RED}✗${NC} Bun nem talalhato. A Telegram plugin nem fog mukodni."
   echo -e "  ${BOLD}Javitas:${NC} curl -fsSL https://bun.sh/install | bash"
   echo -e "  ${DIM}Utana: source ~/.zshrc && ./scripts/start.sh${NC}"
 fi
-if ! claude plugin list 2>/dev/null | grep -q telegram; then
-  echo -e "  ${RED}✗${NC} Telegram plugin nincs telepitve."
-  echo -e "  ${BOLD}Javitas:${NC} claude plugin install telegram@claude-plugins-official"
+PLUGIN_CHECK_PATTERN="${CHANNEL_PROVIDER}"
+if ! claude plugin list 2>/dev/null | grep -q "$PLUGIN_CHECK_PATTERN"; then
+  echo -e "  ${RED}✗${NC} ${CHANNEL_PROVIDER} plugin nincs telepitve."
+  echo -e "  ${BOLD}Javitas:${NC} claude plugin install ${PLUGIN_ID}"
   echo -e "  ${DIM}Utana: ./scripts/stop.sh && ./scripts/start.sh${NC}"
 else
-  echo -e "  ${GREEN}✓${NC} Telegram plugin ellenorizve"
+  echo -e "  ${GREEN}✓${NC} ${CHANNEL_PROVIDER} plugin ellenorizve"
 fi
 
-# Telegram pairing flow
-if [ -n "$BOT_TOKEN" ] && [ "$BOT_TOKEN" != "" ]; then
+# Channel pairing flow (Telegram only; Slack uses OAuth / App install)
+if [ "$CHANNEL_PROVIDER" = "telegram" ] && [ -n "$BOT_TOKEN" ]; then
   echo ""
   echo -e "${BOLD}Telegram parositas${NC}"
   echo -e "${DIM}  A bot fut, most ossze kell parosítanod vele.${NC}"
@@ -491,9 +589,7 @@ if [ -n "$BOT_TOKEN" ] && [ "$BOT_TOKEN" != "" ]; then
   echo ""
   read -p "  Parosito kod (vagy hagyd uresen ha kesobb csinalod): " PAIR_CODE
   if [ -n "$PAIR_CODE" ]; then
-    # Attach to the channels tmux session and run the pairing
-    TELEGRAM_DIR="$HOME/.claude/channels/telegram"
-    ACCESS_FILE="$TELEGRAM_DIR/access.json"
+    ACCESS_FILE="$CHANNEL_DIR/access.json"
     if [ -f "$ACCESS_FILE" ]; then
       # Get the chat ID from the pending pairing in access.json
       PENDING_CHAT_ID=$(python3 -c "
