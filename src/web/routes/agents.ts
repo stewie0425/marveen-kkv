@@ -6,14 +6,13 @@ import { logger } from '../../logger.js'
 import { MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
 import { createAgentMessage } from '../../db.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
+import { getSecret } from '../vault.js'
 import {
   agentDir,
   agentConfigRoot,
   DEFAULT_MODEL,
   readFileOr,
   extractDescriptionFromClaudeMd,
-  readAgentDescription,
-  writeAgentDescription,
   findAvatarForAgent,
   resolveModelId,
   readAgentModel,
@@ -24,6 +23,7 @@ import {
   writeAgentSecurityProfile,
   listAgentNames,
   isKnownAgent,
+  readAgentChannelProvider,
 } from '../agent-config.js'
 import {
   readAgentTeam,
@@ -34,17 +34,29 @@ import {
 } from '../agent-team.js'
 import {
   readAgentTelegramConfig,
+  readMarveenTelegramConfig,
   sendAvatarChangeMessage,
   sendWelcomeMessage,
   validateTelegramToken,
   parseTelegramToken,
 } from '../telegram.js'
 import {
+  createInvite,
+  listInvites,
+  revokeInvite,
+  agentChannelDir,
+} from '../channel-invites.js'
+import {
+  getProvider,
+  channelStateDir,
+  readChannelToken,
+  type ChannelProviderType,
+} from '../../channel-provider.js'
+import {
   writeAgentSettingsFromProfile,
   scaffoldAgentDir,
   generateClaudeMd,
   generateSoulMd,
-  provisionVaultFolder,
 } from '../agent-scaffold.js'
 import {
   isAgentRunning,
@@ -60,6 +72,35 @@ import { sanitizeAgentName } from '../sanitize.js'
 import { parseMultipart } from '../multipart.js'
 import { readBody, json, serveFile } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
+
+const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack'])
+
+function parseChannelProvider(raw: string): ChannelProviderType | null {
+  if (VALID_PROVIDERS.has(raw as ChannelProviderType)) return raw as ChannelProviderType
+  return null
+}
+
+// Match both new /channels/:provider/ and legacy /telegram/ URL patterns.
+// Returns [agentName, provider] or null. Legacy routes always resolve to 'telegram'.
+function matchChannelRoute(path: string, suffix: string): [string, ChannelProviderType] | null {
+  const newPattern = new RegExp(`^/api/agents/([^/]+)/channels/(telegram|slack)${suffix}$`)
+  const newMatch = path.match(newPattern)
+  if (newMatch) {
+    const provider = parseChannelProvider(newMatch[2])
+    if (provider) return [decodeURIComponent(newMatch[1]), provider]
+  }
+  const legacyPattern = new RegExp(`^/api/agents/([^/]+)/telegram${suffix}$`)
+  const legacyMatch = path.match(legacyPattern)
+  if (legacyMatch) return [decodeURIComponent(legacyMatch[1]), 'telegram']
+  return null
+}
+
+function resolveAccessPath(name: string, provider: ChannelProviderType): string {
+  const dir = name === MAIN_AGENT_ID
+    ? channelStateDir(provider)
+    : channelStateDir(provider, agentDir(name))
+  return join(dir, 'access.json')
+}
 
 interface AgentSummary {
   name: string
@@ -98,7 +139,7 @@ function getAgentSummary(name: string): AgentSummary {
   return {
     name,
     displayName: readAgentDisplayName(name),
-    description: readAgentDescription(name, claudeMd),
+    description: extractDescriptionFromClaudeMd(claudeMd),
     model: readAgentModel(name),
     securityProfile: readAgentSecurityProfile(name),
     team: readAgentTeam(name),
@@ -149,6 +190,32 @@ function listAgentSummaries(): AgentSummary[] {
 export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promise<boolean> {
   const { req, res, path, method } = ctx
 
+  // Lists every model the dashboard is willing to serve up to an agent.
+  // Claude IDs are static. DeepSeek is gated behind a vault secret because
+  // the agent-process launcher reads the key from there at start time --
+  // surfacing the option in the UI without the key would let the operator
+  // pick a model that 401s on first prompt. The frontend renders this list
+  // both in the "new agent" wizard and the agent edit panel.
+  if (path === '/api/models/available' && method === 'GET') {
+    const hasDeepseek = getSecret('DEEPSEEK_API_KEY') !== null
+    json(res, {
+      claude: [
+        { id: 'claude-opus-4-7', label: 'Opus 4.7 (legújabb, legjobb)' },
+        { id: 'claude-opus-4-6', label: 'Opus 4.6' },
+        { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (alapértelmezett)' },
+        { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 (leggyorsabb)' },
+      ],
+      deepseek: hasDeepseek
+        ? [
+            { id: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro (1M kontextus, erősebb)' },
+            { id: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash (1M kontextus, gyorsabb/olcsóbb)' },
+          ]
+        : [],
+      deepseekConfigured: hasDeepseek,
+    })
+    return true
+  }
+
   if (path === '/api/agents' && method === 'GET') {
     json(res, listAgentSummaries())
     return true
@@ -182,9 +249,6 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       atomicWriteFileSync(join(agentDir(name), 'CLAUDE.md'), claudeMd)
       atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), soulMd)
       logger.info({ name }, 'Agent created successfully')
-
-      // Provision vault subfolder asynchronously — never blocks the response.
-      provisionVaultFolder(name).catch(err => logger.warn({ name, err }, 'provisionVaultFolder rejected'))
 
       const allAgents = listAgentNames()
       const runningAgents = allAgents.filter(a => a !== name && isAgentRunning(a))
@@ -250,44 +314,49 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     return true
   }
 
-  const tgTestMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/test$/)
-  if (tgTestMatch && method === 'POST') {
-    const name = decodeURIComponent(tgTestMatch[1])
+  // POST /api/agents/:name/channels/:provider/test (legacy: /telegram/test)
+  const testMatch = matchChannelRoute(path, '/test')
+  if (testMatch && method === 'POST') {
+    const [name, provider] = testMatch
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
-    const token = parseTelegramToken(name)
-    if (!token) { json(res, { error: 'Telegram not configured for this agent' }, 404); return true }
-    const result = await validateTelegramToken(token)
-    if (result.ok) { json(res, { ok: true, botUsername: result.botUsername, botId: result.botId }); return true }
+    const stateDir = channelStateDir(provider, agentDir(name))
+    const envPath = join(stateDir, '.env')
+    const token = readChannelToken(provider, envPath) || (provider === 'telegram' ? parseTelegramToken(name) : null)
+    if (!token) { json(res, { error: `${provider} not configured for this agent` }, 404); return true }
+    const channelProvider = getProvider(provider)
+    const result = await channelProvider.validateToken(token)
+    if (result.ok) { json(res, { ok: true, botName: result.botName }); return true }
     json(res, { error: result.error }, 400)
     return true
   }
 
-  const tgSetupMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram$/)
-  if (tgSetupMatch && method === 'POST') {
-    const name = decodeURIComponent(tgSetupMatch[1])
+  // POST /api/agents/:name/channels/:provider (legacy: /telegram) -- setup
+  const setupMatch = matchChannelRoute(path, '')
+  if (setupMatch && method === 'POST') {
+    const [name, provider] = setupMatch
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
 
     const body = await readBody(req)
     const { botToken } = JSON.parse(body.toString()) as { botToken: string }
     if (!botToken?.trim()) { json(res, { error: 'botToken is required' }, 400); return true }
 
-    const validation = await validateTelegramToken(botToken.trim())
-    if (!validation.ok) { json(res, { error: validation.error || 'Invalid bot token' }, 400); return true }
+    const channelProvider = getProvider(provider)
+    const validation = await channelProvider.validateToken(botToken.trim())
+    if (!validation.ok) { json(res, { error: validation.error || 'Invalid token' }, 400); return true }
 
-    const tgDir = join(agentDir(name), '.claude', 'channels', 'telegram')
-    mkdirSync(tgDir, { recursive: true })
-    atomicWriteFileSync(join(tgDir, '.env'), `TELEGRAM_BOT_TOKEN=${botToken.trim()}\n`, { mode: 0o600 })
-    atomicWriteFileSync(join(tgDir, 'access.json'), JSON.stringify({
+    const stateDir = channelStateDir(provider, agentDir(name))
+    mkdirSync(stateDir, { recursive: true })
+    const tokenKey = provider === 'slack' ? 'SLACK_BOT_TOKEN' : 'TELEGRAM_BOT_TOKEN'
+    atomicWriteFileSync(join(stateDir, '.env'), `${tokenKey}=${botToken.trim()}\n`, { mode: 0o600 })
+    atomicWriteFileSync(join(stateDir, 'access.json'), JSON.stringify({
       dmPolicy: 'pairing',
       allowFrom: [],
       groups: {},
       pending: {},
     }, null, 2))
 
-    sendWelcomeMessage(name, botToken.trim()).catch(() => {})
+    if (provider === 'telegram') sendWelcomeMessage(name, botToken.trim()).catch(() => {})
 
-    // If the agent is running, the already-started bun poller is still using
-    // the OLD token. Restart it so the new token actually goes live.
     const wasRunning = isAgentRunning(name)
     let restarted = false
     if (wasRunning) {
@@ -299,16 +368,17 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       }
     }
 
-    json(res, { ok: true, botUsername: validation.botUsername, botId: validation.botId, restarted, wasRunning })
+    json(res, { ok: true, botName: validation.botName, restarted, wasRunning })
     return true
   }
 
-  if (tgSetupMatch && method === 'DELETE') {
-    const name = decodeURIComponent(tgSetupMatch[1])
+  // DELETE /api/agents/:name/channels/:provider (legacy: /telegram) -- remove
+  if (setupMatch && method === 'DELETE') {
+    const [name, provider] = setupMatch
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
-    const tgDir = join(agentDir(name), '.claude', 'channels', 'telegram')
-    const envFile = join(tgDir, '.env')
-    const accessFile = join(tgDir, 'access.json')
+    const stateDir = channelStateDir(provider, agentDir(name))
+    const envFile = join(stateDir, '.env')
+    const accessFile = join(stateDir, 'access.json')
     if (existsSync(envFile)) unlinkSync(envFile)
     if (existsSync(accessFile)) unlinkSync(accessFile)
     json(res, { ok: true })
@@ -423,16 +493,15 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     return true
   }
 
-  const tgPendingMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/pending$/)
-  if (tgPendingMatch && method === 'GET') {
-    const name = decodeURIComponent(tgPendingMatch[1])
-    const accessPath = name === MAIN_AGENT_ID
-      ? join(homedir(), '.claude', 'channels', 'telegram', 'access.json')
-      : join(agentDir(name), '.claude', 'channels', 'telegram', 'access.json')
+  // GET /api/agents/:name/channels/:provider/pending (legacy: /telegram/pending)
+  const pendingMatch = matchChannelRoute(path, '/pending')
+  if (pendingMatch && method === 'GET') {
+    const [name, provider] = pendingMatch
     if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
       json(res, { error: 'Agent not found' }, 404)
       return true
     }
+    const accessPath = resolveAccessPath(name, provider)
     const accessContent = readFileOr(accessPath, '{}')
     try {
       const access = JSON.parse(accessContent)
@@ -451,9 +520,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     return true
   }
 
-  const tgApproveMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/approve$/)
-  if (tgApproveMatch && method === 'POST') {
-    const name = decodeURIComponent(tgApproveMatch[1])
+  // POST /api/agents/:name/channels/:provider/approve (legacy: /telegram/approve)
+  const approveMatch = matchChannelRoute(path, '/approve')
+  if (approveMatch && method === 'POST') {
+    const [name, provider] = approveMatch
     if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
       json(res, { error: 'Agent not found' }, 404)
       return true
@@ -463,10 +533,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const { code } = JSON.parse(body.toString()) as { code: string }
     if (!code?.trim()) { json(res, { error: 'Code is required' }, 400); return true }
 
-    const tgDir = name === MAIN_AGENT_ID
-      ? join(homedir(), '.claude', 'channels', 'telegram')
-      : join(agentDir(name), '.claude', 'channels', 'telegram')
-    const accessPath = join(tgDir, 'access.json')
+    const chDir = name === MAIN_AGENT_ID
+      ? channelStateDir(provider)
+      : channelStateDir(provider, agentDir(name))
+    const accessPath = join(chDir, 'access.json')
     const accessContent = readFileOr(accessPath, '{}')
 
     try {
@@ -483,22 +553,155 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
       delete access.pending[code.trim()]
 
-      // Pairing is one-shot; lock the channel down to allowlist mode now that
-      // we have the sender's id. Matches what install.sh does for the main
-      // agent after the first pairing completes.
       access.dmPolicy = 'allowlist'
 
       atomicWriteFileSync(accessPath, JSON.stringify(access, null, 2))
 
-      const approvedDir = join(tgDir, 'approved')
+      const approvedDir = join(chDir, 'approved')
       mkdirSync(approvedDir, { recursive: true })
       writeFileSync(join(approvedDir, entry.senderId), '')
 
-      logger.info({ name, senderId: entry.senderId, code }, 'Telegram pairing approved')
+      logger.info({ name, provider, senderId: entry.senderId, code }, 'Channel pairing approved')
       json(res, { ok: true, senderId: entry.senderId })
     } catch (err) {
       logger.error({ err }, 'Failed to approve pairing')
       json(res, { error: 'Failed to approve pairing' }, 500)
+    }
+    return true
+  }
+
+  // GET /api/agents/:name/channels/:provider/allowed (legacy: /telegram/allowed)
+  const allowedListMatch = matchChannelRoute(path, '/allowed')
+  if (allowedListMatch && method === 'GET') {
+    const [name, provider] = allowedListMatch
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
+      json(res, { error: 'Agent not found' }, 404)
+      return true
+    }
+    const accessPath = resolveAccessPath(name, provider)
+    const accessContent = readFileOr(accessPath, '{}')
+    try {
+      const access = JSON.parse(accessContent)
+      const users: string[] = Array.isArray(access.allowFrom) ? access.allowFrom : []
+      const groups = Object.entries(access.groups || {}).map(([id, policy]) => ({ id, policy }))
+      json(res, { users, groups })
+    } catch {
+      json(res, { users: [], groups: [] })
+    }
+    return true
+  }
+
+  // POST /api/agents/:name/channels/:provider/invites (legacy: /telegram/invites)
+  const inviteCreateMatch = matchChannelRoute(path, '/invites')
+  if (inviteCreateMatch && method === 'POST') {
+    const [name, provider] = inviteCreateMatch
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
+      json(res, { error: 'Agent not found' }, 404)
+      return true
+    }
+    let botName: string | undefined
+    if (provider === 'telegram') {
+      botName = name === MAIN_AGENT_ID
+        ? readMarveenTelegramConfig().botUsername
+        : readAgentTelegramConfig(name).botUsername
+      if (!botName) {
+        const stateDir = name === MAIN_AGENT_ID ? channelStateDir(provider) : channelStateDir(provider, agentDir(name))
+        const token = readChannelToken(provider, join(stateDir, '.env'))
+        if (token) {
+          const r = await getProvider(provider).validateToken(token)
+          if (r.ok) botName = r.botName
+        }
+      }
+    }
+    const accessPath = resolveAccessPath(name, provider)
+    try {
+      const result = createInvite(accessPath, botName, provider)
+      json(res, result)
+    } catch (err) {
+      logger.error({ err }, 'Failed to create invite')
+      json(res, { error: 'Failed to create invite' }, 500)
+    }
+    return true
+  }
+
+  // GET /api/agents/:name/channels/:provider/invites (legacy: /telegram/invites)
+  if (inviteCreateMatch && method === 'GET') {
+    const [name, provider] = inviteCreateMatch
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
+      json(res, { error: 'Agent not found' }, 404)
+      return true
+    }
+    const accessPath = resolveAccessPath(name, provider)
+    let botName: string | undefined
+    if (provider === 'telegram') {
+      botName = name === MAIN_AGENT_ID
+        ? readMarveenTelegramConfig().botUsername
+        : readAgentTelegramConfig(name).botUsername
+    }
+    const items = listInvites(accessPath).map((inv) => ({
+      ...inv,
+      deepLink: provider === 'telegram' && botName
+        ? `https://t.me/${botName}?start=invite-${inv.token}`
+        : undefined,
+    }))
+    json(res, items)
+    return true
+  }
+
+  // DELETE /api/agents/:name/channels/:provider/invites/:token (legacy: /telegram/invites/:token)
+  const inviteRevokeNewMatch = path.match(/^\/api\/agents\/([^/]+)\/channels\/(telegram|slack)\/invites\/(.+)$/)
+  const inviteRevokeLegacyMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/invites\/(.+)$/)
+  const inviteRevokeMatch = inviteRevokeNewMatch
+    ? { name: decodeURIComponent(inviteRevokeNewMatch[1]), provider: inviteRevokeNewMatch[2] as ChannelProviderType, token: decodeURIComponent(inviteRevokeNewMatch[3]) }
+    : inviteRevokeLegacyMatch
+      ? { name: decodeURIComponent(inviteRevokeLegacyMatch[1]), provider: 'telegram' as ChannelProviderType, token: decodeURIComponent(inviteRevokeLegacyMatch[2]) }
+      : null
+  if (inviteRevokeMatch && method === 'DELETE') {
+    const { name, provider, token } = inviteRevokeMatch
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
+      json(res, { error: 'Agent not found' }, 404)
+      return true
+    }
+    const accessPath = resolveAccessPath(name, provider)
+    const ok = revokeInvite(accessPath, token)
+    if (!ok) { json(res, { error: 'Invite not found' }, 404); return true }
+    json(res, { ok: true })
+    return true
+  }
+
+  // DELETE /api/agents/:name/channels/:provider/allowed/:type/:id (legacy: /telegram/allowed/:type/:id)
+  const allowedRemoveNewMatch = path.match(/^\/api\/agents\/([^/]+)\/channels\/(telegram|slack)\/allowed\/(user|group)\/(.+)$/)
+  const allowedRemoveLegacyMatch = path.match(/^\/api\/agents\/([^/]+)\/telegram\/allowed\/(user|group)\/(.+)$/)
+  const allowedRemoveMatch = allowedRemoveNewMatch
+    ? { name: decodeURIComponent(allowedRemoveNewMatch[1]), provider: allowedRemoveNewMatch[2] as ChannelProviderType, kind: allowedRemoveNewMatch[3], id: decodeURIComponent(allowedRemoveNewMatch[4]) }
+    : allowedRemoveLegacyMatch
+      ? { name: decodeURIComponent(allowedRemoveLegacyMatch[1]), provider: 'telegram' as ChannelProviderType, kind: allowedRemoveLegacyMatch[2], id: decodeURIComponent(allowedRemoveLegacyMatch[3]) }
+      : null
+  if (allowedRemoveMatch && method === 'DELETE') {
+    const { name, provider, kind, id } = allowedRemoveMatch
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) {
+      json(res, { error: 'Agent not found' }, 404)
+      return true
+    }
+    const chDir = name === MAIN_AGENT_ID
+      ? channelStateDir(provider)
+      : channelStateDir(provider, agentDir(name))
+    const accessPath = join(chDir, 'access.json')
+    try {
+      const access = JSON.parse(readFileOr(accessPath, '{}'))
+      if (kind === 'user') {
+        access.allowFrom = (access.allowFrom || []).filter((s: string) => s !== id)
+        const approvedFile = join(chDir, 'approved', id)
+        try { if (existsSync(approvedFile)) unlinkSync(approvedFile) } catch { /* ignore */ }
+      } else {
+        if (access.groups) delete access.groups[id]
+      }
+      atomicWriteFileSync(accessPath, JSON.stringify(access, null, 2))
+      logger.info({ name, provider, kind, id }, 'Channel allowlist entry removed')
+      json(res, { ok: true })
+    } catch (err) {
+      logger.error({ err }, 'Failed to remove allowlist entry')
+      json(res, { error: 'Failed to remove allowlist entry' }, 500)
     }
     return true
   }
@@ -543,13 +746,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     if (!isKnownAgent(name)) { json(res, { error: 'Agent not found' }, 404); return true }
     const body = await readBody(req)
     const configRoot = agentConfigRoot(name)
-    const data = JSON.parse(body.toString()) as { claudeMd?: string; soulMd?: string; mcpJson?: string; model?: string; displayName?: string; description?: string }
+    const data = JSON.parse(body.toString()) as { claudeMd?: string; soulMd?: string; mcpJson?: string; model?: string }
     if (data.claudeMd !== undefined) atomicWriteFileSync(join(configRoot, 'CLAUDE.md'), data.claudeMd)
     if (data.soulMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), data.soulMd)
     if (data.mcpJson !== undefined) atomicWriteFileSync(join(agentDir(name), '.mcp.json'), data.mcpJson)
     if (data.model !== undefined) writeAgentModel(name, data.model)
-    if (data.displayName !== undefined) writeAgentDisplayName(name, data.displayName.trim())
-    if (data.description !== undefined) writeAgentDescription(name, data.description)
     json(res, { ok: true })
     return true
   }
