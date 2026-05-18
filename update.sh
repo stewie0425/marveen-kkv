@@ -115,7 +115,18 @@ fi
 # scratchpads) are allowed -- the --untracked-files=no flag excludes
 # them. Only staged or unstaged modifications to already-tracked files
 # are a block.
-DIRTY=$(git status --porcelain --untracked-files=no | head -n 1)
+#
+# AUTO_STASH=1 (set by the dashboard's "Frissítés stash-elve" button)
+# turns the block into a managed stash + pop pattern: stash before
+# pulling, restore after a successful update. If the pop fails because
+# the upstream change conflicts with the stash, we drop the stash and
+# emit a warning so the operator does not lose work silently -- the
+# stash entry is also kept in `git stash list` for manual recovery.
+STASHED_AUTO=0
+# HEARTBEAT.md is rewritten by the agent every heartbeat tick (self-modifying).
+# Exclude it from the dirty check; the preflight ignores it too. It will be
+# auto-overwritten on the next heartbeat anyway, so no data loss.
+DIRTY=$(git status --porcelain --untracked-files=no | grep -vE ' HEARTBEAT\.md$' | head -n 1)
 if [ -n "$DIRTY" ]; then
   echo -e "${RED}HIBA:${NC} A working tree modosult allapotban van."
   echo "       Commitold vagy stasheld a valtozasokat, majd indithatod ujra:"
