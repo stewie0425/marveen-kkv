@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
 import { OLLAMA_URL } from '../config.js'
 import { resolveFromPath } from '../platform.js'
@@ -9,13 +10,22 @@ import {
   decideSubmitFollowup,
   shouldClearTruncatedPreamble,
 } from '../pane-state.js'
-import { agentDir, readAgentModel, readAgentSecurityProfile } from './agent-config.js'
+import { agentDir, readAgentModel, readAgentSecurityProfile, readAgentClaudeConfigDir, readAgentChannelProvider } from './agent-config.js'
 import { parseTelegramToken } from './telegram.js'
+import { getProvider, getProviderType, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
+import { CHANNEL_PROVIDER } from '../config.js'
 import { loadProfileTemplate } from './profiles.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
+import { getSecret } from './vault.js'
 
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude')
+
+function resolveAgentProvider(name: string): ChannelProviderType {
+  const perAgent = readAgentChannelProvider(name)
+  if (perAgent === 'slack' || perAgent === 'telegram') return perAgent
+  return CHANNEL_PROVIDER
+}
 
 export function agentSessionName(name: string): string {
   return `agent-${name}`
@@ -36,10 +46,18 @@ export function startAgentProcess(name: string): { ok: boolean; pid?: number; er
   const dir = agentDir(name)
   if (!existsSync(dir)) return { ok: false, error: 'Agent not found' }
 
-  const token = parseTelegramToken(name)
-  if (!token) return { ok: false, error: 'Telegram not configured for this agent' }
+  const agentProvider = resolveAgentProvider(name)
+  const provider = getProvider(agentProvider)
+  const agentChannelDir = channelStateDir(agentProvider, dir)
+  const token = readChannelToken(agentProvider, join(agentChannelDir, '.env'))
+  // Backward compat: try legacy Telegram token if provider-aware lookup misses
+  if (!token && agentProvider === 'telegram') {
+    const legacyToken = parseTelegramToken(name)
+    if (!legacyToken) return { ok: false, error: 'Channel not configured for this agent' }
+  } else if (!token) {
+    return { ok: false, error: `${provider.type} channel not configured for this agent` }
+  }
 
-  const tgStateDir = join(dir, '.claude', 'channels', 'telegram')
   const session = agentSessionName(name)
 
   try {
@@ -49,36 +67,76 @@ export function startAgentProcess(name: string): { ok: boolean; pid?: number; er
     } catch { /* ok */ }
 
     const model = readAgentModel(name)
-    const isOllama = !model.startsWith('claude-')
+    const isClaude = model.startsWith('claude-')
+    const isDeepseek = model.startsWith('deepseek-')
+    const isOllama = !isClaude && !isDeepseek
     const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && ` : ''
+    // DeepSeek's /anthropic base URL accepts the literal Anthropic SDK
+    // request format, so Claude Code talks to it as if it were Anthropic.
+    // We pull the API key from the encrypted vault (entry id: DEEPSEEK_API_KEY)
+    // rather than process.env so operators can rotate it from the dashboard
+    // without restarting. We do NOT fail-fast on missing key here -- a 401
+    // from the upstream gives a clearer signal in the agent's tmux pane
+    // than a pre-flight error string the operator would have to dig out of logs.
+    const deepseekKey = isDeepseek ? (getSecret('DEEPSEEK_API_KEY') ?? '') : ''
+    const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && ` : ''
     // Apply security profile: write allow/deny list into settings.json, and
     // skip the dangerously-skip-permissions flag for strict profiles so
     // Claude Code enforces the list rather than bypassing it.
     const profile = loadProfileTemplate(readAgentSecurityProfile(name))
     writeAgentSettingsFromProfile(name, profile)
     const skipFlag = profile.permissionMode === 'strict' ? '' : '--dangerously-skip-permissions '
-    // Recent claude CLI (2.1.119+) refuses --dangerously-skip-permissions
-    // when running as root unless IS_SANDBOX is set. Existing agents that
-    // started under older claude builds keep running fine, but every
-    // subsequent restart hits this gate. Mirror the pattern already used
-    // by hardRestartMarveenChannels so agent-spawn is consistent.
-    const sandboxEnv = process.env.IS_SANDBOX
-      ? `export IS_SANDBOX=${process.env.IS_SANDBOX} && `
-      : 'export IS_SANDBOX=1 && '
-    // bun lives under ~/.bun/bin, which isn't in the dashboard's launchd PATH.
-    // The Claude plugin launcher spawns `bun`, so we must prepend it here.
-    // Defensive unset of TELEGRAM_BOT_TOKEN: if anything ever pollutes the
-    // tmux server's global env again (fresh upgrades, operator manually
-    // sourcing .env), the sub-agent would otherwise inherit the main
-    // agent's token and trigger a 409 Conflict loop. The per-agent .env
-    // in TELEGRAM_STATE_DIR is still the intended source of truth.
-    const cmd = `${sandboxEnv}export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && unset TELEGRAM_BOT_TOKEN && export TELEGRAM_STATE_DIR="${tgStateDir}" && ${ollamaEnv}cd "${dir}" && ${CLAUDE} ${skipFlag}--model ${model} --channels plugin:telegram@claude-plugins-official`
+    // Optional per-agent CLAUDE_CONFIG_DIR (alternate Claude Code config dir,
+    // e.g. for routing this agent to a separate Anthropic login). When the
+    // agent-config field is missing or blank, claudeConfigDir is null and we
+    // emit no export, preserving the default Claude Code behavior.
+    const claudeConfigDir = readAgentClaudeConfigDir(name)
+    const claudeConfigEnv = claudeConfigDir ? `export CLAUDE_CONFIG_DIR="${claudeConfigDir}" && ` : ''
+    // `--continue` requires an existing session; on a brand-new agent the
+    // Claude Code projects directory does not yet exist and `claude` exits
+    // immediately with an obscure "No deferred tool marker found" error
+    // that is silent inside tmux. Detect first launch by probing for the
+    // encoded project dir and skip `--continue` only then. The encoding
+    // mirrors Claude Code's own scheme: replace every `/` with `-`.
+    const projectsRoot = claudeConfigDir
+      ? join(claudeConfigDir, 'projects')
+      : join(homedir(), '.claude', 'projects')
+    const encodedProject = dir.replace(/\//g, '-')
+    const hasPriorSession = existsSync(join(projectsRoot, encodedProject))
+    const continueFlag = hasPriorSession ? '--continue ' : ''
+    const stateEnvVar = agentProvider === 'slack' ? 'SLACK_STATE_DIR' : 'TELEGRAM_STATE_DIR'
+    const unsetTokens = 'unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN'
+    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && export ${stateEnvVar}="${agentChannelDir}" && ${claudeConfigEnv}${ollamaEnv}${deepseekEnv}cd "${dir}" && ${CLAUDE} ${continueFlag}${skipFlag}--model ${model} --channels plugin:${provider.pluginId}`
     execSync(
       `${TMUX} new-session -d -s ${session} "${cmd}"`,
       { timeout: 10000 }
     )
 
     logger.info({ name, session, tgStateDir }, 'Agent tmux session started')
+
+    // After a restart with --continue, a session that's been idle for >24h
+    // shows the "Resume from summary" modal before the prompt input is ready
+    // (113.6k tokens at 2d age in observed cases). Until the operator either
+    // sends a new prompt or dismisses the modal, every scheduled task and
+    // every inter-agent message stalls because isSessionReadyForPrompt sees
+    // a non-idle pane state. The pre-flight dismiss baked into
+    // sendPromptToSession only fires on outgoing traffic -- so on a fresh
+    // restart with no inbound, the modal can sit indefinitely.
+    //
+    // Fire a delayed dismiss after Claude Code has had time to render the
+    // modal. 8 seconds is a comfortable margin in observed restarts (modal
+    // typically appears within 4-6s). Survey-rating modals from prior
+    // sessions can also be present, so dismiss both. Errors are swallowed
+    // -- the outbound pre-flight remains the safety net if this misses.
+    setTimeout(() => {
+      try {
+        dismissSurveyModalIfPresent(session)
+        dismissResumeSummaryModalIfPresent(session)
+      } catch (err) {
+        logger.warn({ err, name, session }, 'Post-restart modal dismiss failed')
+      }
+    }, 8000)
+
     return { ok: true }
   } catch (err) {
     logger.error({ err, name }, 'Failed to start agent tmux session')
@@ -93,19 +151,22 @@ export function stopAgentProcess(name: string): { ok: boolean; error?: string } 
   try {
     execSync(`${TMUX} kill-session -t ${session}`, { timeout: 5000 })
     execSync('sleep 2', { timeout: 4000 })
-    // Reap any orphaned bun server.ts (Telegram plugin) grandchildren that
-    // tmux didn't get. The plugin writes its pid to the agent's telegram
-    // state dir; prefer that, fall back to a token-scoped pkill.
+    // Reap any orphaned plugin grandchildren that tmux didn't get.
+    // The plugin writes its pid to the agent's channel state dir;
+    // prefer that, fall back to a env-var-scoped pkill.
     try {
-      const pidPath = join(agentDir(name), '.claude', 'channels', 'telegram', 'bot.pid')
+      const agentProvider = resolveAgentProvider(name)
+      const dir = agentDir(name)
+      const chanDir = channelStateDir(agentProvider, dir)
+      const pidPath = join(chanDir, 'bot.pid')
       if (existsSync(pidPath)) {
         const pid = parseInt(readFileSync(pidPath, 'utf-8').trim(), 10)
         if (pid > 1) {
           try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
         }
       }
-      const tgStateDir = join(agentDir(name), '.claude', 'channels', 'telegram')
-      execFileSync('/usr/bin/pkill', ['-f', `TELEGRAM_STATE_DIR=${tgStateDir}`], { timeout: 3000 })
+      const stateEnvVar = agentProvider === 'slack' ? 'SLACK_STATE_DIR' : 'TELEGRAM_STATE_DIR'
+      execFileSync('/usr/bin/pkill', ['-f', `${stateEnvVar}=${chanDir}`], { timeout: 3000 })
     } catch { /* pkill returns non-zero if no match -- fine */ }
     logger.info({ name, session }, 'Agent tmux session stopped')
     return { ok: true }

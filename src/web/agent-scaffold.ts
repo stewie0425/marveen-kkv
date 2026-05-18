@@ -1,12 +1,12 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER } from '../config.js'
+import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { agentDir } from './agent-config.js'
 import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
-import { logger } from '../logger.js'
 
 function resolveTemplatePlaceholders(content: string): string {
   return content.replaceAll('{{PROJECT_ROOT}}', PROJECT_ROOT)
@@ -113,7 +113,7 @@ export function scaffoldAgentDir(name: string) {
   const dir = agentDir(name)
   mkdirSync(join(dir, '.claude', 'skills'), { recursive: true })
   mkdirSync(join(dir, '.claude', 'hooks'), { recursive: true })
-  mkdirSync(join(dir, '.claude', 'channels', 'telegram'), { recursive: true })
+  mkdirSync(channelStateDir(CHANNEL_PROVIDER, dir), { recursive: true })
   mkdirSync(join(dir, 'memory'), { recursive: true })
 
   // Initialize empty files if they don't exist
@@ -121,28 +121,14 @@ export function scaffoldAgentDir(name: string) {
   if (!existsSync(memoryMd)) writeFileSync(memoryMd, '')
   const mcpJson = join(dir, '.mcp.json')
   if (!existsSync(mcpJson)) {
-    // Start from the shared MCP config so agents get access to common tools.
-    // Then scope the obsidian entry to this agent's own vault subfolder.
+    // Copy shared MCP config so agents get access to common tools (e.g. aiam-blog)
     const sharedMcp = join(PROJECT_ROOT, '.mcp.json')
-    let mcpConfig: { mcpServers: Record<string, unknown> } = { mcpServers: {} }
     if (existsSync(sharedMcp)) {
-      try {
-        mcpConfig = JSON.parse(readFileSync(sharedMcp, 'utf-8'))
-      } catch {
-        mcpConfig = { mcpServers: {} }
-      }
+      copyFileSync(sharedMcp, mcpJson)
+    } else {
+      // Valid empty shape -- `claude /doctor` rejects plain "{}"
+      atomicWriteFileSync(mcpJson, JSON.stringify({ mcpServers: {} }, null, 2))
     }
-    if (mcpConfig.mcpServers?.obsidian) {
-      const obsidian = mcpConfig.mcpServers.obsidian as Record<string, unknown>
-      mcpConfig.mcpServers.obsidian = {
-        ...obsidian,
-        env: {
-          ...((obsidian.env as Record<string, string>) ?? {}),
-          OBSIDIAN_VAULT_ROOT: name,
-        },
-      }
-    }
-    atomicWriteFileSync(mcpJson, JSON.stringify(mcpConfig, null, 2))
   }
   // Seed settings.json from template so the agent gets the PreCompact
   // hook (memory save + skill reflection) out of the box. Only if the
@@ -252,12 +238,25 @@ Minden kontextus-tömörítés előtt (PreCompact hook) automatikusan vizsgáld 
 MINDIG a megfelelő lokális időt használd (Europe/Budapest CEST/CET).
 
 - **Jelenlegi idő**: \`date\` Bash első lépés időponti feladatoknál (heartbeat, naptár-művelet, scheduled-task analízis)
-- **Telegram channel \`ts\`**: UTC-ben jön (postfix \`Z\`), átkonvertálni Europe/Budapest-re (CEST = UTC+2 nyáron, CET = UTC+1 télen)
+- **Channel message \`ts\`**: UTC-ben jön (postfix \`Z\`), átkonvertálni Europe/Budapest-re (CEST = UTC+2 nyáron, CET = UTC+1 télen)
 - **Google Calendar list_events \`dateTime\`**: már lokál ISO 8601 (\`+02:00\` offset Budapestnek), OK
 - **SQLite \`unixepoch()\`**: UTC, humán-megjelenítéshez \`localtime\` modifier kell
 - **Cron expressions** (scheduled-tasks task-config.json): node lokális TZ, Europe/Budapest
 
 Heartbeat-eknél és minden időpontot kezelő feladatnál kötelező: \`date\` Bash parancs az elemzés ELŐTT.
+
+## Új ismeretlen sender első üzenete (ARANYSZABÁLY)
+
+Ha egy senderId üzen a csatornán AKIT EDDIG NEM ISMERSZ — nem szerepel az aktív interakciós kontextusodban, és nem találsz róla memóriabejegyzést a vault-ban — KÖTELEZŐ ELSŐKÉNT inter-agent message-t küldeni Marveennek MIELŐTT érdemi választ adsz.
+
+Az AGENT TULAJDONOSA (az első, aki ezt az ügynököt telepítette és párosította) az ALAPÉRTELMEZETT engedélyezett sender — őt nem kell ellenőrizni. MINDEN további senderId első üzenete (a 2., 3., stb. párosított személy vagy csoport) pinging-trigger.
+
+Példa ping Marveennek:
+curl -s -X POST http://localhost:3420/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"AGENT_NAME\\",\\"to\\":\\"marveen\\",\\"content\\":\\"Ismeretlen sender [ID] jelezett első üzenettel: '[üzenet röviden]'. Ki ez, mit válaszoljak?\\"}"
+
+Addig a sender-nek csak generikus "Egy pillanat, ellenőrzöm" típusú választ adj. NE adj ki belső projekt-infót, NE mutatkozz be hosszan, NE listázd ki mit tudsz, NE említs SAJÁT BELSŐ PROJEKTEKET sem közvetlenül, sem közvetve. Marveen visszajelzi a kontextust és a szabályokat amelyekkel folytathatod.
+
+Ez a szabály mindenkire vonatkozik — akkor is ha valaki ismerős nevén mutatkozna be. A senderId a végső azonosító, NEM a self-claimed név. Egy idegen tudja a nevet, de a senderId-t nem hamisíthatja.
 
 Output ONLY the markdown content, no code fences.`
 
@@ -326,53 +325,4 @@ Output ONLY the markdown content, no code fences.`
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')
   }
   return cleaned
-}
-
-const OBSIDIAN_ENV_FILE = '/etc/marveen/obsidian-rest.env'
-const OBSIDIAN_BASE_URL = process.env.OBSIDIAN_BASE_URL ?? 'https://localhost:27124'
-
-function readObsidianApiKey(): string {
-  try {
-    for (const line of readFileSync(OBSIDIAN_ENV_FILE, 'utf-8').split('\n')) {
-      const t = line.trim()
-      if (!t || t.startsWith('#')) continue
-      const eq = t.indexOf('=')
-      if (eq === -1) continue
-      if (t.slice(0, eq).trim() !== 'OBSIDIAN_REST_API_KEY') continue
-      let val = t.slice(eq + 1).trim()
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1)
-      return val
-    }
-  } catch { /* env file absent */ }
-  return process.env.OBSIDIAN_REST_API_KEY ?? ''
-}
-
-// Create the agent's vault subfolder via the Obsidian REST API.
-// A .gitkeep placeholder is written which forces the directory into existence.
-// Fires after agent creation; failures are logged but never block the response.
-export async function provisionVaultFolder(name: string): Promise<void> {
-  const apiKey = readObsidianApiKey()
-  if (!apiKey) {
-    logger.warn({ name }, 'provisionVaultFolder: OBSIDIAN_REST_API_KEY not set, skipping vault folder creation')
-    return
-  }
-  // The Obsidian REST API silently discards empty-body PUTs (returns 204 but
-  // creates nothing). Use a minimal README so the directory actually appears.
-  const url = `${OBSIDIAN_BASE_URL}/vault/${encodeURIComponent(name)}/README.md`
-  try {
-    const res = await fetch(url, {
-      method: 'PUT',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'text/markdown' },
-      body: `# ${name}\n`,
-      // @ts-expect-error Bun-specific TLS option for self-signed cert
-      tls: { rejectUnauthorized: false },
-    })
-    if (res.ok || res.status === 409) {
-      logger.info({ name }, 'Vault folder provisioned')
-    } else {
-      logger.warn({ name, status: res.status }, 'provisionVaultFolder: unexpected response from Obsidian API')
-    }
-  } catch (err) {
-    logger.warn({ name, err }, 'provisionVaultFolder: fetch failed (Obsidian API unreachable?)')
-  }
 }
