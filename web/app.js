@@ -479,8 +479,96 @@ async function showCardDetail(card) {
     }
   }
 
+  // Load children (subtasks)
+  try {
+    const childRes = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/children`)
+    const children = await childRes.json()
+    const section = document.getElementById('cardChildrenSection')
+    const list = document.getElementById('cardChildrenList')
+    if (children.length > 0) {
+      section.style.display = ''
+      list.innerHTML = ''
+      const statusLabelsShort = { planned: 'Tervezett', in_progress: 'Folyamatban', waiting: 'Vár', done: 'Kész' }
+      for (const ch of children) {
+        const div = document.createElement('div')
+        div.className = 'comment-item'
+        div.style.cursor = 'pointer'
+        div.innerHTML = `<div><strong>${escapeHtml(ch.title)}</strong> <span style="color:var(--text-muted)">[${statusLabelsShort[ch.status] || ch.status}]</span></div>
+          <div style="font-size:0.85em; color:var(--text-muted)">${ch.assignee ? escapeHtml(ch.assignee) : ''} ${ch.description ? '-- ' + escapeHtml(ch.description).slice(0, 80) : ''}</div>`
+        div.onclick = () => { closeModal(cardDetailOverlay); showCardDetail(ch) }
+        list.appendChild(div)
+      }
+    } else {
+      section.style.display = 'none'
+    }
+  } catch { document.getElementById('cardChildrenSection').style.display = 'none' }
+
+  // Breakdown button
+  document.getElementById('cardBreakdownBtn').onclick = async () => {
+    const btn = document.getElementById('cardBreakdownBtn')
+    btn.disabled = true
+    btn.textContent = 'Generálás...'
+    try {
+      const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) { showToast(data.error || 'Hiba'); btn.disabled = false; btn.textContent = '⚡ AI szétbont'; return }
+      breakdownCardId = card.id
+      breakdownSubtasks = data.subtasks
+      showBreakdownModal(data.subtasks, card)
+    } catch {
+      showToast('Breakdown hiba')
+    } finally {
+      btn.disabled = false
+      btn.textContent = '⚡ AI szétbont'
+    }
+  }
+
   openModal(cardDetailOverlay)
 }
+
+// === Breakdown modal ===
+let breakdownCardId = null
+let breakdownSubtasks = []
+const breakdownOverlay = document.getElementById('breakdownOverlay')
+const breakdownClose = document.getElementById('breakdownClose')
+const breakdownAcceptBtn = document.getElementById('breakdownAcceptBtn')
+const breakdownRejectBtn = document.getElementById('breakdownRejectBtn')
+
+function showBreakdownModal(subtasks, card) {
+  const list = document.getElementById('breakdownList')
+  document.getElementById('breakdownProvider').textContent = `Kártya: ${card.title}`
+  list.innerHTML = ''
+  for (const st of subtasks) {
+    const div = document.createElement('div')
+    div.className = 'comment-item'
+    div.innerHTML = `<div><strong>${escapeHtml(st.title)}</strong> <span style="color:var(--text-muted)">[${st.priority || 'normal'}]</span>${st.assignee ? ` <span style="color:var(--text-muted)">${escapeHtml(st.assignee)}</span>` : ''}</div>
+      ${st.description ? `<div style="font-size:0.85em; color:var(--text-muted)">${escapeHtml(st.description)}</div>` : ''}`
+    list.appendChild(div)
+  }
+  openModal(breakdownOverlay)
+}
+
+breakdownClose.addEventListener('click', () => closeModal(breakdownOverlay))
+breakdownRejectBtn.addEventListener('click', () => closeModal(breakdownOverlay))
+breakdownAcceptBtn.addEventListener('click', async () => {
+  breakdownAcceptBtn.disabled = true
+  try {
+    const res = await fetch(`/api/kanban/${encodeURIComponent(breakdownCardId)}/breakdown/accept`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subtasks: breakdownSubtasks }),
+    })
+    const data = await res.json()
+    if (!res.ok) { showToast(data.error || 'Hiba'); return }
+    closeModal(breakdownOverlay)
+    showToast(`${data.created.length} subtask létrehozva`)
+    loadKanban()
+  } catch {
+    showToast('Hiba a subtask létrehozásakor')
+  } finally {
+    breakdownAcceptBtn.disabled = false
+  }
+})
 
 // === Elements: Agents ===
 const agentsGrid = document.getElementById('agentsGrid')
