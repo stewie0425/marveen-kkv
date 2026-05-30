@@ -9,7 +9,7 @@ import {
 import { join } from 'node:path'
 import { execFileSync, execSync } from 'node:child_process'
 import type { Server as HttpServer } from 'node:http'
-import { STORE_DIR, WEB_PORT, ALLOWED_CHAT_ID, MAIN_AGENT_ID } from './config.js'
+import { STORE_DIR, WEB_PORT, ALLOWED_CHAT_ID, MAIN_AGENT_ID, PROJECT_ROOT } from './config.js'
 import { initDatabase } from './db.js'
 import { runDecaySweep, runDailyDigest } from './memory.js'
 import { initHeartbeat, stopHeartbeat } from './heartbeat.js'
@@ -53,7 +53,10 @@ const SHUTDOWN_HARD_KILL_MS = 5000
 // bearing: without them, `\b` matched `dist/index.js.map`, `dist/index.js.bak`
 // and other sibling files, and unrelated editor/bundler processes touching
 // those files would get SIGKILLed on startup.
-const DASHBOARD_BINARY_PATTERN = /(?:^|[\s/])(?:dist\/index\.js|src\/index\.ts)(?:\s|$)/
+// Scoped to the marveen-kkv project path so co-located marveen instances
+// (e.g. the main dashboard on the same host) are not mistakenly killed.
+const _escapedRoot = PROJECT_ROOT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const DASHBOARD_BINARY_PATTERN = new RegExp(`${_escapedRoot}/(?:dist/index\\.js|src/index\\.ts)(?:\\s|$)`)
 
 // Build the I/O surface used by process-lock.ts. Kept here so the pure
 // module stays testable with a mock ctx and never imports node:child_process

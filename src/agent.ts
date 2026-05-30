@@ -3,8 +3,6 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import { PROJECT_ROOT } from './config.js'
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
 
 const TYPING_REFRESH_MS = 4000
 import { logger } from './logger.js'
