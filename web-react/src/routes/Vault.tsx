@@ -46,6 +46,22 @@ function EyeIcon({ open }: { open: boolean }) {
   )
 }
 
+async function copyToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  // Fallback for HTTP (non-secure) contexts
+  const el = document.createElement('textarea')
+  el.value = text
+  el.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0'
+  document.body.appendChild(el)
+  el.focus()
+  el.select()
+  if (!document.execCommand('copy')) throw new Error('copy failed')
+  document.body.removeChild(el)
+}
+
 export default function VaultPage() {
   const qc = useQueryClient()
   const [showForm, setShowForm] = useState(false)
@@ -53,11 +69,19 @@ export default function VaultPage() {
   const [revealed, setRevealed] = useState<Record<string, string>>({})
   const [revealing, setRevealing] = useState<Record<string, boolean>>({})
   const [copied, setCopied] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
 
   const { data: secrets = [], isLoading } = useQuery({
     queryKey: ['vault-secrets'],
     queryFn: () => apiJson<SecretMeta[]>('/api/vault-secrets'),
   })
+
+  const filteredSecrets = search.trim()
+    ? secrets.filter(s =>
+        s.key_name.toLowerCase().includes(search.toLowerCase()) ||
+        (s.description ?? '').toLowerCase().includes(search.toLowerCase())
+      )
+    : secrets
 
   const deleteMut = useMutation({
     mutationFn: (keyName: string) =>
@@ -88,9 +112,13 @@ export default function VaultPage() {
       const data = await apiJson<SecretFull>(`/api/vault-secrets/${encodeURIComponent(keyName)}`)
       value = data.value
     }
-    await navigator.clipboard.writeText(value)
-    setCopied(keyName)
-    setTimeout(() => setCopied(null), 2000)
+    try {
+      await copyToClipboard(value)
+      setCopied(keyName)
+      setTimeout(() => setCopied(null), 2000)
+    } catch {
+      // ignore
+    }
   }
 
   return (
@@ -101,6 +129,18 @@ export default function VaultPage() {
         actions={<Button onClick={() => { setEditKey(null); setShowForm(true) }}>Új titok</Button>}
       />
 
+      {!isLoading && secrets.length > 0 && (
+        <div className="mb-3">
+          <input
+            type="search"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Keresés kulcs vagy leírás alapján…"
+            className="w-full rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-input)] px-3 py-2 text-sm focus:border-[var(--color-border-focus)] focus:outline-none"
+          />
+        </div>
+      )}
+
       <div className="rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden">
         {isLoading ? (
           <div className="py-12 text-center text-sm text-[var(--color-text-muted)]">Betöltés…</div>
@@ -109,6 +149,10 @@ export default function VaultPage() {
             <div className="text-[var(--color-text-muted)]"><KeyIcon /></div>
             <p className="text-sm text-[var(--color-text-muted)]">Még nincs tárolt titok.</p>
             <Button onClick={() => { setEditKey(null); setShowForm(true) }}>Első titok hozzáadása</Button>
+          </div>
+        ) : filteredSecrets.length === 0 ? (
+          <div className="py-10 text-center text-sm text-[var(--color-text-muted)]">
+            Nincs találat: <span className="font-mono">"{search}"</span>
           </div>
         ) : (
           <table className="w-full text-sm">
@@ -122,7 +166,7 @@ export default function VaultPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--color-border)]">
-              {secrets.map(s => (
+              {filteredSecrets.map(s => (
                 <tr key={s.key_name} className="hover:bg-[var(--color-surface-hover)] transition-colors group">
                   <td className="px-4 py-3">
                     <span className="font-mono text-xs bg-[var(--color-code)] px-1.5 py-0.5 rounded text-[var(--color-text)]">
