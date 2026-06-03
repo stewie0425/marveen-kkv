@@ -170,7 +170,7 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
         execFileSync(
           '/usr/bin/git',
           ['fetch', 'origin', 'main', '--no-tags', '--quiet'],
-          { cwd: PROJECT_ROOT, timeout: 30_000, encoding: 'utf-8' },
+          { cwd: PROJECT_ROOT, timeout: 5_000, encoding: 'utf-8' },
         )
         const rawLog = execFileSync(
           '/usr/bin/git',
@@ -185,13 +185,19 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
           const allFiles = commits.flatMap(c => c.files ?? [])
           if (allFiles.length > 0) status.components = deriveComponents(allFiles)
         } else {
-          // origin is in sync (fork case) -- show upstream Szotasz commits instead
-          const upstream = await refreshUpstreamStatus()
-          if (upstream.commits.length > 0) {
-            status.commits = upstream.commits
-            status.behind = upstream.commits.length
+          // origin is in sync (fork case) -- use the upstream cache populated by
+          // startUpdateChecker()'s parallel refreshUpstreamStatus() call. Never
+          // call refreshUpstreamStatus() inline here: that would block every
+          // /api/updates/check with a live GitHub round-trip on top of the
+          // already-slow git fetch, causing page-load timeouts.
+          const cached = getUpstreamStatus()
+          if (cached.commits.length > 0) {
+            status.commits = cached.commits
+            status.behind = cached.commits.length
             status.remote = UPSTREAM_REPO
           }
+          // Cache empty on first boot: behind stays 0 until the parallel
+          // refreshUpstreamStatus() from startUpdateChecker() completes (~10s).
         }
       } catch {
         status.error = 'Local HEAD not found on GitHub -- different fork or unpushed commits?'
@@ -208,8 +214,14 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
 // local HEAD. Lets the dashboard show a "new version available" badge
 // without anyone having to SSH in and run update.sh.
 export function startUpdateChecker(): NodeJS.Timeout {
-  // First check shortly after startup; then every 15 minutes.
-  setTimeout(() => { refreshUpdateStatus().catch(() => {}); refreshUpstreamStatus().catch(() => {}) }, 10_000)
+  // On startup: populate upstream cache first so refreshUpdateStatus() can
+  // read it from getUpstreamStatus() without a live GitHub call.
+  setTimeout(() => {
+    refreshUpstreamStatus()
+      .catch(() => {})
+      .finally(() => { refreshUpdateStatus().catch(() => {}) })
+  }, 10_000)
+  // Periodic refresh every 15 minutes -- upstream cache is warm, order doesn't matter.
   return setInterval(() => { refreshUpdateStatus().catch(() => {}); refreshUpstreamStatus().catch(() => {}) }, 15 * 60_000)
 }
 
