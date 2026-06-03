@@ -159,7 +159,13 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
         status.components = deriveComponents(filenames)
       }
     } else if (cmpRes.status === 404) {
-      // Local HEAD not on the remote; fall back to local git for commit list.
+      // Local HEAD not on GitHub. Two cases:
+      // (a) Unpushed local commits -- try git log against origin/main.
+      // (b) Fork with diverged history (origin is not GitHub) -- git log
+      //     returns empty because HEAD == origin/main on the non-GitHub remote.
+      //     In that case fall back to the upstream (Szotasz/marveen) commit list
+      //     so the dashboard shows what is new upstream rather than a misleading
+      //     "0 commits behind" status.
       try {
         execFileSync(
           '/usr/bin/git',
@@ -172,11 +178,21 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
           { cwd: PROJECT_ROOT, timeout: 5_000, encoding: 'utf-8' },
         ).trim()
         const commits = parseGitLogWithFiles(rawLog)
-        status.commits = commits
-        status.behind = commits.length
-        // Aggregate components across all pending commits
-        const allFiles = commits.flatMap(c => c.files ?? [])
-        if (allFiles.length > 0) status.components = deriveComponents(allFiles)
+        if (commits.length > 0) {
+          status.commits = commits
+          status.behind = commits.length
+          // Aggregate components across all pending commits
+          const allFiles = commits.flatMap(c => c.files ?? [])
+          if (allFiles.length > 0) status.components = deriveComponents(allFiles)
+        } else {
+          // origin is in sync (fork case) -- show upstream Szotasz commits instead
+          const upstream = await refreshUpstreamStatus()
+          if (upstream.commits.length > 0) {
+            status.commits = upstream.commits
+            status.behind = upstream.commits.length
+            status.remote = UPSTREAM_REPO
+          }
+        }
       } catch {
         status.error = 'Local HEAD not found on GitHub -- different fork or unpushed commits?'
       }
