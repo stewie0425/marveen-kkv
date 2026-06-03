@@ -1,5 +1,7 @@
 import { execFileSync } from 'node:child_process'
-import { PROJECT_ROOT } from '../config.js'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { PROJECT_ROOT, STORE_DIR } from '../config.js'
 
 export interface UpdateCommit {
   sha: string
@@ -19,6 +21,11 @@ export interface UpdateStatus {
   components?: string[]
   remote: string
   lastChecked: number
+  /** True when displayed commits are upstream-only review candidates (not in GitLab origin).
+   *  Apply button must not be shown in this state. */
+  upstreamOnly?: boolean
+  /** Number of upstream commits hidden because they touch fork-customised files. */
+  skippedCount?: number
   error?: string
 }
 
@@ -70,6 +77,53 @@ function parseGitLogWithFiles(raw: string): UpdateCommit[] {
     })
   }
   return commits
+}
+
+// ---------------------------------------------------------------------------
+// Upstream safety filter
+// ---------------------------------------------------------------------------
+
+interface UpstreamFilterCommit {
+  sha: string
+  short?: string
+  message?: string
+  author?: string
+  date?: string
+}
+
+interface UpstreamFilterFile {
+  safe: UpstreamFilterCommit[]
+  affectsDashboard: UpstreamFilterCommit[]
+}
+
+/** Read store/upstream-filter.json written by the sandor-upstream-safety task.
+ *
+ *  The upstream cache only holds the latest 15 commits (per_page=15), but SAFE
+ *  commits are often older docs/seed-skill changes outside that window.  We
+ *  therefore use the filter file's own commit metadata as the authoritative
+ *  SAFE list, enriching with cache entries where available.
+ */
+function applyUpstreamFilter(commits: UpdateCommit[]): { safe: UpdateCommit[]; skippedCount: number } {
+  const filterPath = join(STORE_DIR, 'upstream-filter.json')
+  let filter: UpstreamFilterFile | null = null
+  try {
+    filter = JSON.parse(readFileSync(filterPath, 'utf-8')) as UpstreamFilterFile
+  } catch {
+    // Filter file missing (first boot before daily task ran) -- show all commits.
+    return { safe: commits, skippedCount: 0 }
+  }
+  // Enrich filter entries with richer metadata from the cache where available.
+  const cacheMap = new Map(commits.map(c => [c.sha, c]))
+  const safe: UpdateCommit[] = filter.safe.map(fc =>
+    cacheMap.get(fc.sha) ?? {
+      sha: fc.sha,
+      short: fc.short ?? fc.sha.slice(0, 7),
+      message: fc.message ?? '',
+      author: fc.author ?? '',
+      date: fc.date ?? '',
+    }
+  )
+  return { safe, skippedCount: filter.affectsDashboard.length }
 }
 
 let updateStatusCache: UpdateStatus = {
@@ -192,8 +246,17 @@ export async function refreshUpdateStatus(): Promise<UpdateStatus> {
           // already-slow git fetch, causing page-load timeouts.
           const cached = getUpstreamStatus()
           if (cached.commits.length > 0) {
-            status.commits = cached.commits
-            status.behind = cached.commits.length
+            // Apply safety filter from the daily sandor-upstream-safety task.
+            // The filter file contains commits classified as SAFE (cherry-pick
+            // safe) vs AFFECTS-DASHBOARD (touches fork-customised files).
+            // Only SAFE commits are shown; behind stays 0 so the Apply button
+            // never appears for upstream-only commits (update.sh cannot apply
+            // them -- they are not in GitLab origin yet).
+            const filtered = applyUpstreamFilter(cached.commits)
+            status.commits = filtered.safe
+            status.behind = 0          // no Apply button: upstream commits need cherry-pick first
+            status.upstreamOnly = true
+            status.skippedCount = filtered.skippedCount
             status.remote = UPSTREAM_REPO
           }
           // Cache empty on first boot: behind stays 0 until the parallel

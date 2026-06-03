@@ -1,5 +1,5 @@
 import {
-  readFileSync, writeFileSync, mkdirSync, openSync, closeSync, statSync, unlinkSync,
+  readFileSync, writeFileSync, mkdirSync, statSync, unlinkSync,
 } from 'node:fs'
 import { join } from 'node:path'
 import { spawn, execFileSync } from 'node:child_process'
@@ -163,17 +163,13 @@ export async function tryHandleUpdates(ctx: RouteContext): Promise<boolean> {
       return true
     }
     try {
-      let outFd: number | 'ignore' = 'ignore'
-      try {
-        mkdirSync(STORE_DIR, { recursive: true })
-        outFd = openSync(join(STORE_DIR, 'update.log'), 'a', 0o600)
-      } catch (err) {
-        logger.warn({ err }, 'Could not open update.log for update.sh stdio; falling back to ignore')
-      }
+      // update.sh uses `exec > >(tee -a update.log)` internally, so passing an
+      // outFd pointing at the same file doubles every log line. Let update.sh
+      // own its own logging; dashboard side uses stdio: ignore.
       const child = spawn('/bin/bash', [join(PROJECT_ROOT, 'update.sh')], {
         cwd: PROJECT_ROOT,
         detached: true,
-        stdio: ['ignore', outFd, outFd],
+        stdio: 'ignore',
       })
       child.on('error', (err) => {
         logger.error({ err }, 'update.sh spawn reported an async error')
@@ -184,9 +180,6 @@ export async function tryHandleUpdates(ctx: RouteContext): Promise<boolean> {
         if (stillOurs) releaseLock()
       })
       child.unref()
-      if (typeof outFd === 'number') {
-        try { closeSync(outFd) } catch { /* already closed */ }
-      }
       json(res, { ok: true })
     } catch (err) {
       releaseLock()
